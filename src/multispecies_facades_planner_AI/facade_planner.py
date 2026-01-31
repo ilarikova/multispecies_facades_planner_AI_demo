@@ -1,15 +1,13 @@
 #global import
 import math
-import compas_ghpython
 from shapely.geometry import Point
 import random
-#local import
-from . import facade_planner_functions as fpf
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Any
 from typing import List, Dict, Any, Tuple
 
+from . import facade_planner_functions as fpf
 
 def to_meters_range(val, default=(200.0, 200.0)):
     a, b = fpf.parse_range_float(val, default=default)
