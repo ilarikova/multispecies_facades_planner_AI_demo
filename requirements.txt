@@ -4,4 +4,5 @@ plotly
 joblib
 pandas
 scikit-learn
+shapely==2.0.2
 -e .
