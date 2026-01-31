@@ -21,9 +21,6 @@ from mpl_toolkits.mplot3d import proj3d
 #internal
 from multispecies_facades_planner_AI import facade_planner as fp
 from multispecies_facades_planner_AI import facade_planner_functions as fpf
-from multispecies_facades_planner_AI.data_extraction import load_species_core_as_dict, load_species_training_as_dict
-
-
 
  
 def make_iteration_id(prefix="iter") -> str:

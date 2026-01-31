@@ -7,10 +7,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from joblib import dump, load
 
-#internal
-from multispecies_facades_planner_AI import facade_planner as fp
-from multispecies_facades_planner_AI import facade_planner_functions as fpf
-from multispecies_facades_planner_AI.facade_planner_trainer_global import load_all_feedback_global
+
 
  
 def log_feedback(
