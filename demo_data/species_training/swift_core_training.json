@@ -1,0 +1,11 @@
+{
+  "swift": {
+    "nest_height": "> 6 ",
+    "colonie": "\"yes\"",
+    "if_colonial_distance_to_next_nest": " 50 - 100",
+    "colonie_size": null,
+    "diet_type": 1.0,
+    "time_of_activity": "day, evening",
+    "species_noise": "high"
+  }
+}

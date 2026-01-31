@@ -1,0 +1,9 @@
+{
+  "house_martin": {
+    "nest_height": "> 2.5",
+    "colonie": "yes",
+    "if_colonial_distance_to_next_nest": 0,
+    "colonie_size": null,
+    "diet_type": 1.0
+  }
+}

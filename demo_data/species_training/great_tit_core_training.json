@@ -1,0 +1,11 @@
+{
+  "great_tit": {
+    "nest_height": "2.5-4",
+    "colonie": "no",
+    "if_colonial_distance_to_next_nest": "no",
+    "colonie_size": null,
+    "diet_type": 2.0,
+    "time_of_activity": "day",
+    "species_noise": "medium"
+  }
+}
