@@ -5,16 +5,13 @@ import streamlit as st
 from pathlib import Path
 import re
 from joblib import load
-import multispecies_facades_planner_AI as mcfp
-import inspect
-import streamlit as st
-
 
 from multispecies_facades_planner_AI.facade_planner import (
     generate_colony_candidates,
     generate_solitary_candidates,
 )
 from multispecies_facades_planner_AI.facade_planner_trainer_global import score_with_global_ranker_new
+
 
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "demo_data"
@@ -24,9 +21,27 @@ MODELS_DIR = DATA_DIR / "models"
 MODEL_PATH = MODELS_DIR / "ranker_global_2026-01-31_16-15-48.joblib"
 ICONS_DIR = DATA_DIR / "icons"
 
+
+BUILDINGS = {
+    "Am Bachl 30": {
+        "address": "85049 Ingolstadt",
+        "walls_json": "building.json",
+        "roof_json": "building5128_roofs.json",
+        "building_id": "5128",
+    },
+    "Sauerstraße 7": {
+        "address": "85049 Ingolstadt",
+        "walls_json": "building4115_demo_.json",
+        "roof_json": "building4115_roofs.json",
+        "building_id": "4115",
+    },
+}
+
+
 @st.cache_resource
 def load_model_pack(path: Path) -> dict:
     return load(path)
+
 
 def render_tag_chips(tags, *, max_tags=4):
     if not tags:
@@ -52,6 +67,7 @@ def render_tag_chips(tags, *, max_tags=4):
     )
     st.markdown(f"**Reasons:** {chips}", unsafe_allow_html=True)
 
+
 def triangulate_faces(faces):
     I, J, K = [], [], []
     for f in faces or []:
@@ -63,6 +79,7 @@ def triangulate_faces(faces):
             J.append(f[i])
             K.append(f[i + 1])
     return I, J, K
+
 
 def add_mesh(fig, mesh, name, opacity=0.15, color=None):
     V = np.asarray(mesh["vertices"], dtype=float)
@@ -84,6 +101,7 @@ def add_mesh(fig, mesh, name, opacity=0.15, color=None):
         )
     )
 
+
 def wall_mesh_normal(wall: dict) -> np.ndarray:
     mesh = wall.get("mesh") or {}
     fn = mesh.get("face_normals")
@@ -93,6 +111,7 @@ def wall_mesh_normal(wall: dict) -> np.ndarray:
         n = np.asarray((wall.get("plane") or {}).get("zaxis", [0, 0, 1]), dtype=float)
     n = n / (np.linalg.norm(n) + 1e-12)
     return n
+
 
 def uv_to_xyz(plane: dict, uv, offset_m: float = 0.0, offset_dir=None):
     o = np.array(plane["origin"], dtype=float)
@@ -106,11 +125,13 @@ def uv_to_xyz(plane: dict, uv, offset_m: float = 0.0, offset_dir=None):
         p = p + offset_m * n
     return p
 
+
 def triangulate_convex_polygon(points_uv):
     n = len(points_uv)
     if n < 3:
         return []
     return [(0, i, i + 1) for i in range(1, n - 1)]
+
 
 def add_filled_uv_polygon(
     fig,
@@ -147,6 +168,7 @@ def add_filled_uv_polygon(
         )
     )
 
+
 def nice_species_label(stem: str) -> str:
     s = stem
     s = re.sub(r"^cre[_-]*", "", s, flags=re.IGNORECASE)
@@ -154,6 +176,7 @@ def nice_species_label(stem: str) -> str:
     s = re.sub(r"\bcore\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+", " ", s).strip()
     return s[:1].upper() + s[1:] if s else stem
+
 
 def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name=""):
     c = np.asarray(center_xyz, dtype=float)
@@ -175,6 +198,7 @@ def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name=
             showlegend=False,
         )
     )
+
 
 def add_candidate_points_and_circles(fig, candidate: dict, walls_data: dict, radius_m=0.10, label="1"):
     wall_id = candidate["wall_id"]
@@ -199,10 +223,12 @@ def add_candidate_points_and_circles(fig, candidate: dict, walls_data: dict, rad
         for p in pts:
             add_circle_on_plane(fig, p, plane, radius_m=radius_m, name=f"circle_{label}")
 
+
 def load_json_path(p: Path) -> dict:
     if not p.exists():
         raise FileNotFoundError(f"Missing file: {p}")
     return json.loads(p.read_text(encoding="utf-8"))
+
 
 def unwrap_species_core(species_wrapped: dict, species_key: str) -> dict:
     if isinstance(species_wrapped, dict):
@@ -214,6 +240,7 @@ def unwrap_species_core(species_wrapped: dict, species_key: str) -> dict:
                 return species_wrapped[only_key]
     return species_wrapped
 
+
 def truthy_yes(v) -> bool:
     if isinstance(v, bool):
         return v
@@ -223,6 +250,7 @@ def truthy_yes(v) -> bool:
         return v.strip().lower() in {"yes", "y", "true", "1", "ja"}
     return False
 
+
 def truthy_no(v) -> bool:
     if isinstance(v, bool):
         return not v
@@ -231,6 +259,7 @@ def truthy_no(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in {"no", "n", "false", "0", "nein"}
     return False
+
 
 def species_mode_from_core(species_core: dict) -> str:
     if not isinstance(species_core, dict):
@@ -250,6 +279,7 @@ def species_mode_from_core(species_core: dict) -> str:
     if "if_colonial_distance_to_next_nest" in species_core:
         return "colony"
     return "solitary"
+
 
 def find_training_species_file(species_id: str, species_key: str) -> Path | None:
     candidates = [
@@ -288,6 +318,7 @@ def find_training_species_file(species_id: str, species_key: str) -> Path | None
             return scored[0][1]
     return None
 
+
 def add_wall_floor_function_labels(
     fig,
     walls_data: dict,
@@ -295,7 +326,6 @@ def add_wall_floor_function_labels(
     offset_xy_m: float = 1.5,
     z_lift_m: float = 0.2,
 ):
-    # estimate a "ground" z from all wall meshes
     zs = []
     for w in walls_data.values():
         m = w.get("mesh") or {}
@@ -316,20 +346,18 @@ def add_wall_floor_function_labels(
             continue
 
         V = np.asarray(V, dtype=float)
-        c = V.mean(axis=0)  # centroid
+        c = V.mean(axis=0)
 
-        # wall normal -> XY direction
         n = wall_mesh_normal(wall)
         d = np.array([n[0], n[1], 0.0], dtype=float)
         dn = np.linalg.norm(d)
         if dn < 1e-9:
-            # fallback: push in +Y if normal has no XY component
             d = np.array([0.0, 1.0, 0.0], dtype=float)
             dn = 1.0
         d = d / dn
 
         p = c + offset_xy_m * d
-        p[2] = label_z  # force onto "XY plane"
+        p[2] = label_z
 
         fig.add_trace(
             go.Scatter3d(
@@ -344,13 +372,16 @@ def add_wall_floor_function_labels(
             )
         )
 
+
 @st.cache_data
 def load_json_file(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
+
 @st.cache_data
 def load_json(filename: str) -> dict:
     return load_json_file(DATA_DIR / filename)
+
 
 @st.cache_data
 def load_species(species_id: str) -> dict:
@@ -359,6 +390,7 @@ def load_species(species_id: str) -> dict:
         raise FileNotFoundError(path)
     return load_json_file(path)
 
+
 @st.cache_data
 def load_species_icon_bytes(species_id: str) -> bytes | None:
     for ext in (".png", ".jpg", ".jpeg", ".webp"):
@@ -366,6 +398,7 @@ def load_species_icon_bytes(species_id: str) -> bytes | None:
         if p.exists():
             return p.read_bytes()
     return None
+
 
 @st.cache_resource
 def build_base_figure(walls_data: dict, roof_mesh: dict) -> go.Figure:
@@ -411,6 +444,13 @@ def build_base_figure(walls_data: dict, roof_mesh: dict) -> go.Figure:
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), scene=dict(aspectmode="data"))
     return fig
 
+
+def reset_results_state():
+    for k in ["top3", "selected_option_idx", "top3_meta"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+
 st.set_page_config(layout="wide")
 st.title("NestWorks– demo")
 
@@ -419,10 +459,31 @@ if not MODEL_PATH.exists():
     st.stop()
 _ = load_model_pack(MODEL_PATH)
 
-BUILDING_ADDRESS = "Am Bachl 30, 85049 Ingolstadt"
-st.sidebar.header("Building address:")
-st.sidebar.caption(BUILDING_ADDRESS)
-st.sidebar.header("Species selection")
+st.sidebar.header("Building selection")
+
+building_choices = list(BUILDINGS.keys())
+default_building_key = building_choices[0] if building_choices else None
+
+if "building_key" not in st.session_state and default_building_key is not None:
+    st.session_state.building_key = default_building_key
+
+building_key = st.sidebar.selectbox(
+    "Address",
+    building_choices,
+    index=building_choices.index(st.session_state.building_key) if st.session_state.building_key in building_choices else 0,
+    key="building_selectbox",
+)
+
+if "prev_building_key" not in st.session_state:
+    st.session_state.prev_building_key = building_key
+if st.session_state.prev_building_key != building_key:
+    st.session_state.prev_building_key = building_key
+    reset_results_state()
+
+binfo = BUILDINGS.get(building_key, {})
+st.sidebar.caption(binfo.get("address", ""))
+
+st.sidebar.header("Specie selection")
 
 species_files = sorted(p.stem for p in SPECIES_DIR.glob("*.json"))
 if not species_files:
@@ -430,7 +491,7 @@ if not species_files:
     st.stop()
 
 species_id = st.sidebar.selectbox(
-    "Species",
+    "Specie",
     species_files,
     format_func=nice_species_label,
     key="species_selectbox",
@@ -440,17 +501,23 @@ if "prev_species_id" not in st.session_state:
     st.session_state.prev_species_id = species_id
 if st.session_state.prev_species_id != species_id:
     st.session_state.prev_species_id = species_id
-    for k in ["top3", "selected_option_idx", "top3_meta"]:
-        if k in st.session_state:
-            del st.session_state[k]
+    reset_results_state()
 
 run = st.sidebar.button("Generate options", key="generate_btn")
 
 _ = load_species(species_id)
 species_key = nice_species_label(species_id).lower().replace(" ", "_")
 
-walls_data = load_json("building.json")
-roof_mesh = load_json("building5128_roofs.json")
+walls_fn = binfo.get("walls_json", "")
+roof_fn = binfo.get("roof_json", "")
+building_id = str(binfo.get("building_id", building_key))
+
+try:
+    walls_data = load_json(walls_fn)
+    roof_mesh = load_json(roof_fn)
+except Exception as e:
+    st.error(f"Failed loading building geometry files for '{building_key}': {e}")
+    st.stop()
 
 base_fig = build_base_figure(walls_data, roof_mesh)
 fig = go.Figure(base_fig)
@@ -520,7 +587,7 @@ if run:
             building_dict=walls_data,
             species_dict={species_key: species_training_core},
             iteration_id="demo",
-            building_id="5128",
+            building_id=building_id,
         )
 
     if df_features is None or len(df_features) == 0:
@@ -556,9 +623,7 @@ if run:
         st.warning("Top-3 candidates could not be matched back to generated candidates.")
         st.stop()
 
-    # CHANGE: update icon species ONLY when Generate options is clicked
     st.session_state.generated_species_id = species_id
-    # (optional) cache icon bytes for that generated species, to avoid re-reading file on reruns
     st.session_state.generated_species_icon_bytes = load_species_icon_bytes(species_id)
 
     st.session_state.top3 = top3
@@ -610,13 +675,10 @@ if "top3" in st.session_state and st.session_state.top3:
 
     add_candidate_points_and_circles(fig, sel, walls_data, label=str(pick_idx + 1), radius_m=0.10)
 
-# --- 3D VIEW ---
 fig_ph.plotly_chart(fig, use_container_width=True, key="main_3d")
 st.markdown("<div style='height:80px'></div>", unsafe_allow_html=True)
 
-# --- ICON ALWAYS BELOW THE 3D VIEW ---
 with st.container():
-    # CHANGE: use generated species icon only (updates only after Generate options)
     icon_bytes = st.session_state.get("generated_species_icon_bytes", None)
     if icon_bytes:
         c1, c2, c3 = st.columns([3, 1, 3])
