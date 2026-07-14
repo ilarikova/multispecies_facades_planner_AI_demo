@@ -4,3 +4,6 @@ build/
 dist/
 __pycache__/
 *.pyc
+
+# Local dev server logs
+streamlit_log.txt

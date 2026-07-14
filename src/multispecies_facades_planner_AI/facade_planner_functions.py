@@ -9,12 +9,12 @@ from shapely.ops import unary_union
 import statistics
 from dataclasses import dataclass
 from typing import Dict, Tuple, Union, List, Any, Optional
+import re 
 
 def load_building_dict(json_path: str | Path) -> dict:
     json_path = Path(json_path)
     with json_path.open("r", encoding="utf-8") as f:
         return json.load(f)
-
 
 def polygon_area_2d(poly_uv: Sequence[Sequence[float]]) -> float:
     """
@@ -57,12 +57,15 @@ def wall_with_max_free_area(building_dict: dict):
     biggest_area = None
 
     for wall_id, wall in building_dict.items():
+        if not isinstance(wall, dict):
+            continue
         area = free_wall_area(wall)
         if biggest_area is None or area > biggest_area:
             biggest_area = area
             biggest_wall_id = wall_id
 
     return biggest_wall_id, biggest_area
+
 
 def derive_openings(wall: dict):
     """
@@ -94,7 +97,6 @@ def derive_openings(wall: dict):
 
     holes = unary_union(opening_polys)
     return wall_poly.difference(holes)
-
 
 def build_offset_area(
     wall: dict,
@@ -212,6 +214,8 @@ def wall_hot_climate_median(building_dict: dict):
     best_median = None
 
     for wall_id, wall in building_dict.items():
+        if not isinstance(wall, dict):
+            continue
         median = evaluate_climate_median(wall)
         if median is None:
             continue
@@ -222,90 +226,63 @@ def wall_hot_climate_median(building_dict: dict):
 
     return best_wall_id, best_median
 
-
-@dataclass
-class ScoreResult:
-    score: float
-    reasons: List[Tuple[str, float]]  # (rule_name, delta)
-    meta: Dict
-
-def evaluate_for_colony(building_dict: dict, wall_id: str) -> ScoreResult:
-    wall = building_dict.get(wall_id)
-
-    # unsuitable if not wall
-    if not wall:
-        return ScoreResult(
-            score=0.0,
-            reasons=[("unsuitable", -1)],
-            meta={"unsuitable": True}
-        )
-
-    reasons = []
-    score = 0.0
-
-    hottest_wall_id, hottest_median = wall_hot_climate_median(building_dict)
-    biggest_wall_id, biggest_free_area = wall_with_max_free_area(building_dict)
-
-    #Rule 1: context / adjacency
-    floor_fn = wall.get("floor_function")
-    if floor_fn == "neigbor_building":
-        return ScoreResult(
-            score=0.0,
-            reasons=[("unsuitable_neighbor_building", -1)],
-            meta={
-                "unsuitable": True,
-                "floor_fn": floor_fn,
-            },
-        )
-
-    if floor_fn == "pedestrian":
-        score -= 2
-        reasons.append(("floor_function=pedestrian", -2))
-    elif floor_fn == "garden":
-        score += 5
-        reasons.append(("floor_function=garden", +5))
-
-    #Rule 2: free area
-    wall_free = free_wall_area(wall)
-
-    if biggest_free_area and biggest_free_area > 0:
-        rel = wall_free / biggest_free_area  # 0..1+
-        delta = (rel - 0.5) * 2               # ~ -1 .. +1
-        score += delta
-        reasons.append(("free_area_relative", delta))
-
-    if wall_free <= 3:
-        score -= 3
-        reasons.append(("free_area<=3", -3))
-
-    #Rule 3: doors 
-    door_count = len(wall.get("doors") or {})
-    if door_count == 0:
-        score += 1
-        reasons.append(("door_count=0", +1))
-    elif door_count > 2:
-        score -= 1
-        reasons.append(("door_count>2", -1))
-
-    # Rule 4: hottest wall penalty 
-    if hottest_wall_id == wall_id:
-        score -= 3
-        reasons.append(("hottest_wall_penalty", -3))
-
-    # out-
-    return ScoreResult(
-        score=score,
-        reasons=reasons,
-        meta={
-            "unsuitable": False,
-            "wall_free": wall_free,
-            "biggest_free_area": biggest_free_area,
-            "hottest_median": hottest_median,
-            "floor_fn": floor_fn,
-            "door_count": door_count,
-        },
+def _clean_numeric_text(val) -> str:
+    """
+    Normalize numeric text from Excel:
+    '2,5-4' -> '2.5-4'
+    '2,5 – 4' -> '2.5-4'
+    """
+    return (
+        str(val)
+        .replace('"', '')
+        .replace("\xa0", " ")
+        .replace(",", ".")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("≥", ">=")
+        .replace("≤", "<=")
+        .strip()
     )
 
+def parse_min_max_numeric(val):
+    """
+    Extracts numeric min/max from values like:
+    '2,5-4', '2.5-4', '> 4', '15 - 31'
+    """
+    if val is None:
+        return None, None
+
+    s = _clean_numeric_text(val)
+
+    nums = re.findall(r"\d+(?:\.\d+)?", s)
+
+    if not nums:
+        return None, None
+
+    nums = [float(n) for n in nums]
+
+    return min(nums), max(nums)
+
+def parse_min_max_count(val, default=(np.nan, np.nan)):
+    if val is None:
+        return default
+
+    s = str(val).strip().lower().replace(" ", "")
+    if not s:
+        return default
+
+    s = s.replace("–", "-").replace("—", "-")
+
+    if s.startswith(">"):
+        n = int(float(s.lstrip(">").lstrip("=")))
+        return n, None
+
+    if "-" in s:
+        a, b = s.split("-", 1)
+        return int(float(a)), int(float(b))
+
+    n = int(float(s))
+    return n, n
 
 def parse_range_int(val, default=(0, 0)):
     if val is None:
@@ -351,33 +328,39 @@ def parse_range_int(val, default=(0, 0)):
     return n, n
 
 def parse_range_float(s: str, default=(0.5, 1.0)):
-    """'50-100' -> (50.0,100.0)."""
-    if not s:
+    """
+    Supports:
+    '50-100', '0,5-1', '0.5-1'
+    """
+    if s is None or str(s).strip() == "":
         return default
-    s = str(s).replace('"', '').strip()
+
+    s = _clean_numeric_text(s)
+
     if "-" in s:
         a, b = s.split("-", 1)
         return float(a.strip()), float(b.strip())
+
     v = float(s.strip())
     return v, v
 
 def parse_min_height_m(s: str, default=0.0):
     """
-    Supports forms like '> 4', '>=4', '4', '2.5-4'.
-    Returns minimum height in meters (float).
+    Supports forms like:
+    '> 4', '>=4', '4', '2.5-4', '2,5-4'
+    Returns minimum height in meters.
     """
-    if not s:
+    if s is None or str(s).strip() == "":
         return float(default)
 
-    s = str(s).replace('"', '').strip()
-    s = s.replace("≥", ">=")
+    s = _clean_numeric_text(s)
 
     if s.startswith(">="):
         return float(s[2:].strip())
+
     if s.startswith(">"):
         return float(s[1:].strip())
 
-    # range like "2.5-4"
     if "-" in s:
         try:
             lo, _ = s.split("-", 1)
@@ -385,7 +368,6 @@ def parse_min_height_m(s: str, default=0.0):
         except ValueError:
             return float(default)
 
-    # fallback: treat as numeric
     try:
         return float(s)
     except ValueError:
@@ -393,16 +375,15 @@ def parse_min_height_m(s: str, default=0.0):
     
 def parse_max_height_m(s: str):
     """
-    Supports forms like '2.5-4', '<4', '<=4'.
-    Returns maximum height in meters (float) or None if not applicable.
+    Supports forms like:
+    '2.5-4', '2,5-4', '<4', '<=4'
+    Returns maximum height in meters, or None if no max constraint.
     """
-    if not s:
+    if s is None or str(s).strip() == "":
         return None
 
-    s = str(s).replace('"', '').strip()
-    s = s.replace("≤", "<=")
+    s = _clean_numeric_text(s)
 
-    # range like "2.5-4"
     if "-" in s:
         try:
             _, hi = s.split("-", 1)
@@ -410,15 +391,13 @@ def parse_max_height_m(s: str):
         except ValueError:
             return None
 
-    # upper bound only
     if s.startswith("<="):
         return float(s[2:].strip())
+
     if s.startswith("<"):
         return float(s[1:].strip())
 
-    # no max constraint (e.g. ">4", "4")
     return None
-
 
 def dist_uv(a, b):
     du = a[0] - b[0]
@@ -580,115 +559,667 @@ def vertical_edges_xyz(wall: dict, u_snap_tol: float = 0.02):
     return out
 
 
-# ---------------------------------------
-# Main: find neighbor floor functions
-# ---------------------------------------
+def wall_grid_points(wall: dict):
+    grid = wall.get("grid", {}) or {}
+    pts = []
+
+    for pdata in grid.values():
+        if not isinstance(pdata, dict):
+            continue
+
+        uv = pdata.get("uv")
+        xyz = pdata.get("point_on_wall")
+
+        if not uv or not xyz:
+            continue
+
+        pts.append((
+            float(uv[0]),
+            float(uv[1]),
+            (
+                float(xyz[0]),
+                float(xyz[1]),
+                float(xyz[2]),
+            )
+        ))
+
+    return pts
+
+
+def local_uv_side_edge_xyz(
+    wall: dict,
+    side: str,
+    u_local_tol: float = 0.05,
+):
+    """
+    Get approximate XYZ vertical edge from local UV side.
+
+    side:
+      'umin' = local left side
+      'umax' = local right side
+    """
+    pts = wall_grid_points(wall)
+
+    if not pts:
+        return None
+
+    us = [p[0] for p in pts]
+    umin = min(us)
+    umax = max(us)
+    du = max(umax - umin, 1e-9)
+
+    if side == "umin":
+        side_pts = [
+            xyz for u, v, xyz in pts
+            if ((u - umin) / du) <= u_local_tol
+        ]
+
+    elif side == "umax":
+        side_pts = [
+            xyz for u, v, xyz in pts
+            if ((u - umin) / du) >= (1.0 - u_local_tol)
+        ]
+
+    else:
+        raise ValueError("side must be 'umin' or 'umax'.")
+
+    if len(side_pts) < 2:
+        return None
+
+    bottom = min(side_pts, key=lambda p: p[2])
+    top = max(side_pts, key=lambda p: p[2])
+
+    return bottom, top
+
+
+def edge_xy_midpoint(edge):
+    p0, p1 = edge
+    return (
+        (p0[0] + p1[0]) / 2.0,
+        (p0[1] + p1[1]) / 2.0,
+    )
+
+
+def edge_xy_distance(edge_a, edge_b):
+    ax, ay = edge_xy_midpoint(edge_a)
+    bx, by = edge_xy_midpoint(edge_b)
+
+    return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+
 
 def neighbor_floor_functions(
     building_dict: Dict[str, dict],
     wall_id: str,
     *,
-    edge_match_tol_m: float = 0.25,   # 20–30 cm is often good
-    u_snap_tol: float = 0.02,         # UV snapping tolerance
+    u_local_tol: float = 0.05,
+    max_neighbor_distance_m: float | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Returns a list of neighbor walls that share a vertical edge with wall_id and have floor_function.
-    Each item: {"neighbor_id":..., "floor_function":..., "matched_side":..., "neighbor_side":...}
+    Returns closest physical neighbor for local UV sides:
+      - umin
+      - umax
+
+    Local UV defines the side.
+    XYZ/XY geometry finds the closest neighboring wall.
     """
 
     wall = building_dict.get(wall_id)
     if not isinstance(wall, dict):
         return []
 
-    target_edges = vertical_edges_xyz(wall, u_snap_tol=u_snap_tol)
-    if not target_edges:
-        return []
+    target_edges = {
+        "umin": local_uv_side_edge_xyz(
+            wall,
+            "umin",
+            u_local_tol=u_local_tol,
+        ),
+        "umax": local_uv_side_edge_xyz(
+            wall,
+            "umax",
+            u_local_tol=u_local_tol,
+        ),
+    }
 
-    results = []
+    best_by_side = {
+        "umin": None,
+        "umax": None,
+    }
 
-    for other_id, other_wall in building_dict.items():
-        if other_id == wall_id:
+    for side, target_edge in target_edges.items():
+        if target_edge is None:
             continue
-        if not isinstance(other_wall, dict) or other_id.startswith("_"):
-            continue
 
-        # ignore walls without floor_function entirely (your rule)
-        ff = other_wall.get("floor_function", None)
-        if not ff:
-            continue
+        for other_id, other_wall in building_dict.items():
+            if other_id == wall_id:
+                continue
 
-        other_edges = vertical_edges_xyz(other_wall, u_snap_tol=u_snap_tol)
-        if not other_edges:
-            continue
+            if not isinstance(other_wall, dict) or other_id.startswith("_"):
+                continue
 
-        # Compare each vertical edge pair: endpoints can be swapped
-        for (p0, p1), side in target_edges:
-            for (q0, q1), qside in other_edges:
-                d_direct = max(_dist(p0, q0), _dist(p1, q1))
-                d_swap   = max(_dist(p0, q1), _dist(p1, q0))
+            ff = other_wall.get("floor_function")
+            ff_norm = (
+                str(ff).strip().lower()
+                if ff is not None and str(ff).strip()
+                else "none"
+            )
 
-                if min(d_direct, d_swap) <= edge_match_tol_m:
-                    results.append({
-                        "neighbor_id": other_id,
-                        "floor_function": ff,
-                        "matched_side": side,        # which side of target wall (umin/umax)
-                        "neighbor_side": qside,      # which side of neighbor wall matched
-                        "match_error_m": min(d_direct, d_swap),
-                    })
+            other_edges = {
+                "umin": local_uv_side_edge_xyz(
+                    other_wall,
+                    "umin",
+                    u_local_tol=u_local_tol,
+                ),
+                "umax": local_uv_side_edge_xyz(
+                    other_wall,
+                    "umax",
+                    u_local_tol=u_local_tol,
+                ),
+            }
 
-    # de-duplicate by neighbor_id (keep best match)
-    best = {}
-    for r in results:
-        nid = r["neighbor_id"]
-        if nid not in best or r["match_error_m"] < best[nid]["match_error_m"]:
-            best[nid] = r
+            for other_side, other_edge in other_edges.items():
+                if other_edge is None:
+                    continue
 
-    return sorted(best.values(), key=lambda x: x["match_error_m"])
+                dist = edge_xy_distance(target_edge, other_edge)
 
+                if (
+                    max_neighbor_distance_m is not None
+                    and dist > max_neighbor_distance_m
+                ):
+                    continue
+
+                candidate = {
+                    "neighbor_id": other_id,
+                    "floor_function": ff_norm,
+                    "matched_side": side,
+                    "neighbor_side": other_side,
+                    "match_error_m": float(dist),
+                }
+
+                current = best_by_side[side]
+
+                if current is None or dist < current["match_error_m"]:
+                    best_by_side[side] = candidate
+
+    return [
+        best_by_side[side]
+        for side in ["umin", "umax"]
+        if best_by_side[side] is not None
+    ]
 
 def wall_uv_bbox_from_building(building_dict: dict, wall_id: str) -> Optional[Tuple[float, float, float, float]]:
     wall = building_dict.get(wall_id)
     if not isinstance(wall, dict):
         return None
+
     buv = wall.get("boundary_uv") or []
     if len(buv) < 3:
         return None
+
     us = [p[0] for p in buv]
     vs = [p[1] for p in buv]
     return (min(us), min(vs), max(us), max(vs))
+
 
 def candidate_mean_uv(candidate: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     cuv = candidate.get("uv")
     if not cuv or len(cuv) == 0:
         return None
+
     u = float(np.mean([p[0] for p in cuv]))
     v = float(np.mean([p[1] for p in cuv]))
     return (u, v)
 
-def sector_3x3(u: float, v: float, bbox: Tuple[float, float, float, float]) -> Tuple[int, int, int]:
+
+def sector_3x3_labels(
+    u: float,
+    v: float,
+    bbox: Tuple[float, float, float, float],
+) -> Tuple[str, str]:
+    """
+    Returns categorical sector labels:
+      section_row: 'bottom' / 'middle' / 'top'
+      section_col: 'left' / 'middle' / 'right'
+    """
     umin, vmin, umax, vmax = bbox
+
     du = max(umax - umin, 1e-9)
     dv = max(vmax - vmin, 1e-9)
 
     un = (u - umin) / du
     vn = (v - vmin) / dv
 
-    # clamp to [0, 1)
+    # clamp to [0,1)
     un = min(max(un, 0.0), 0.999999)
     vn = min(max(vn, 0.0), 0.999999)
 
-    col = int(un * 3)          # 0..2
-    row = int(vn * 3)          # 0..2
-    sid = row * 3 + col        # 0..8
-    return row, col, sid
+    col_idx = int(un * 3)   # 0..2
+    row_idx = int(vn * 3)   # 0..2
+
+    col_labels = ["left", "middle", "right"]
+    row_labels = ["bottom", "middle", "top"]
+
+    return row_labels[row_idx], col_labels[col_idx]
+
 
 def sector_features_3x3(building_dict: dict, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns categorical 3x3 sector features.
+    """
     wall_id = candidate["wall_id"]
     bbox = wall_uv_bbox_from_building(building_dict, wall_id)
     uv = candidate_mean_uv(candidate)
 
     if bbox is None or uv is None:
-        return {"section_row": np.nan, "section_col": np.nan, "section_id": np.nan}
+        return {
+            "section_row": None,
+            "section_col": None,
+        }
 
-    row, col, sid = sector_3x3(uv[0], uv[1], bbox)
-    return {"section_row": int(row), "section_col": int(col), "section_id": int(sid)}
+    row_label, col_label = sector_3x3_labels(uv[0], uv[1], bbox)
+
+    return {
+        "section_row": row_label,
+        "section_col": col_label,
+    }
+
+
+import statistics
+from typing import Dict, Any
+
+
+def precompute_wall_climate_features(building_dict: Dict[str, dict]) -> None:
+    """
+    Computes and stores wall-level and sector-level climate medians in-place.
+    Grid point UV is read from pt["uv"] = [u, v] (world-scale UV space,
+    same coordinate system as boundary_uv).
+    """
+    for wall_id, wall in building_dict.items():
+        if not isinstance(wall, dict) or wall_id.startswith("_"):
+            continue
+
+        # ── whole-wall median ─────────────────────────────────────────────
+        wall["wall_climate_median"] = evaluate_climate_median(wall)
+
+        # ── sector medians ────────────────────────────────────────────────
+        bbox = wall_uv_bbox_from_building(building_dict, wall_id)
+        if bbox is None:
+            wall["sector_climate_medians_3x3"] = {}
+            continue
+
+        sector_values: Dict[str, list] = {}
+
+        for pt in (wall.get("grid") or {}).values():
+            uv      = pt.get("uv")          # [u, v] in world-scale UV space
+            climate = pt.get("climate")
+
+            if not uv or len(uv) < 2 or climate is None:
+                continue
+
+            u, v = float(uv[0]), float(uv[1])
+
+            row_label, col_label = sector_3x3_labels(u, v, bbox)
+            key = f"{row_label}_{col_label}"
+
+            sector_values.setdefault(key, []).append(climate)
+
+        sector_medians = {}
+        for key, values in sector_values.items():
+            if values:
+                sector_medians[key] = float(statistics.median(values))
+
+        wall["sector_climate_medians_3x3"] = sector_medians
+
+def candidate_sector_climate_median_3x3(
+    building_dict: dict,
+    candidate: Dict[str, Any],
+) -> float:
+    """
+    Returns the precomputed climate median for the 3x3 sector
+    where the candidate is located.
+    """
+
+    wall_id = candidate["wall_id"]
+    wall = building_dict.get(wall_id)
+
+    if wall is None:
+        return None
+
+    bbox = wall_uv_bbox_from_building(building_dict, wall_id)
+    uv = candidate_mean_uv(candidate)
+
+    if bbox is None or uv is None:
+        return None
+
+    row_label, col_label = sector_3x3_labels(uv[0], uv[1], bbox)
+    key = f"{row_label}_{col_label}"
+
+    sector_medians = wall.get("sector_climate_medians_3x3", {})
+    return sector_medians.get(key)
+
+
+import statistics
+from typing import Dict, Any, Optional
+
+
+
+def candidate_roof_edge_distance_median(
+    building_dict: dict,
+    candidate: Dict[str, Any],
+) -> Optional[float]:
+    """
+    Returns the median perpendicular distance from candidate nests to the
+    nearest top edge of the wall.
+
+    Top edges are defined as boundary segments where BOTH endpoints are
+    above the nest's V position. For each nest the shortest perpendicular
+    distance across all top edges is used. If the foot of the perpendicular
+    falls outside the segment, the distance to the nearest endpoint is used
+    instead (acceptable fallback, see design notes).
+
+    Works for rectangular, triangular, and any polygon wall shape.
+    """
+
+    wall_id = candidate["wall_id"]
+    wall    = building_dict.get(wall_id)
+    if wall is None:
+        return None
+
+    buv = wall.get("boundary_uv") or []
+    if len(buv) < 3:
+        return None
+
+    # build closed loop of boundary segments
+    loop = buv + [buv[0]]
+    segments = [(loop[i], loop[i + 1]) for i in range(len(loop) - 1)]
+
+    uvs = candidate.get("uv") or []
+    if not uvs:
+        return None
+
+    def point_to_segment_dist(px, py, ax, ay, bx, by) -> float:
+        """
+        Shortest distance from point P to segment AB.
+        Uses perpendicular foot if it falls inside the segment,
+        otherwise falls back to nearest endpoint.
+        """
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+
+        if seg_len_sq < 1e-12:
+            # degenerate segment — return distance to endpoint
+            return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+
+        # parameter t of the foot along AB
+        t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+        t = max(0.0, min(1.0, t))   # clamp to [0, 1]
+
+        foot_x = ax + t * dx
+        foot_y = ay + t * dy
+
+        return math.sqrt((px - foot_x) ** 2 + (py - foot_y) ** 2)
+
+    dists = []
+    for uv in uvs:
+        if not uv or len(uv) < 2:
+            continue
+        px, py = float(uv[0]), float(uv[1])
+
+        # collect top edges: both endpoints strictly above nest V
+        top_edges = [
+            (a, b) for a, b in segments
+            if a[1] > py and b[1] > py
+        ]
+
+        if not top_edges:
+            continue
+
+        # shortest perpendicular distance across all top edges
+        d = min(
+            point_to_segment_dist(px, py, a[0], a[1], b[0], b[1])
+            for a, b in top_edges
+        )
+        dists.append(d)
+
+    if not dists:
+        return None
+
+    return float(statistics.median(dists))
+
+def candidate_side_edge_distance_median(
+    building_dict: dict,
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Returns:
+      - median distance from candidate nests to the nearest side boundary
+        of the wall, measured as a horizontal ray in UV space.
+      - dominant side label: 'umin' or 'umax'
+
+    For each nest a horizontal ray is cast left and right at the nest's V
+    position. It intersects the actual wall boundary_uv polygon to find the
+    true wall edge at that height — correct for triangular, rectangular, and
+    any polygon wall shape.
+
+    If the ray finds no intersection on one side (e.g. nest is outside the
+    wall polygon), that side is skipped.
+    """
+
+    wall_id = candidate["wall_id"]
+    wall    = building_dict.get(wall_id)
+    if wall is None:
+        return {"side_edge_distance_median": None, "side_edge_label": None}
+
+    buv = wall.get("boundary_uv") or []
+    if len(buv) < 3:
+        return {"side_edge_distance_median": None, "side_edge_label": None}
+
+    # closed boundary loop as segments
+    loop     = buv + [buv[0]]
+    segments = [(loop[i], loop[i + 1]) for i in range(len(loop) - 1)]
+
+    # U extent for ray length
+    us   = [p[0] for p in buv]
+    umin = min(us)
+    umax = max(us)
+
+    uvs = candidate.get("uv") or []
+    if not uvs:
+        return {"side_edge_distance_median": None, "side_edge_label": None}
+
+    def ray_u_intersections(px: float, py: float) -> list[float]:
+        """
+        Returns all U values where the horizontal line V=py intersects
+        the wall boundary segments.
+        """
+        hits = []
+        for (ax, ay), (bx, by) in segments:
+            # skip horizontal segments
+            if abs(by - ay) < 1e-9:
+                continue
+            t = (py - ay) / (by - ay)
+            if 0.0 <= t <= 1.0:
+                u_hit = ax + t * (bx - ax)
+                hits.append(u_hit)
+        return hits
+
+    dists       = []
+    side_labels = []
+
+    for uv in uvs:
+        if not uv or len(uv) < 2:
+            continue
+        px, py = float(uv[0]), float(uv[1])
+
+        hits = ray_u_intersections(px, py)
+        if not hits:
+            continue
+
+        # intersections to the left and right of the nest
+        left_hits  = [u for u in hits if u <= px]
+        right_hits = [u for u in hits if u >= px]
+
+        d_left  = (px - max(left_hits))  if left_hits  else None
+        d_right = (min(right_hits) - px) if right_hits else None
+
+        if d_left is None and d_right is None:
+            continue
+
+        if d_left is None:
+            dists.append(d_right)
+            side_labels.append("umax")
+        elif d_right is None:
+            dists.append(d_left)
+            side_labels.append("umin")
+        elif d_left <= d_right:
+            dists.append(d_left)
+            side_labels.append("umin")
+        else:
+            dists.append(d_right)
+            side_labels.append("umax")
+
+    if not dists:
+        return {"side_edge_distance_median": None, "side_edge_label": None}
+
+    n_umin         = side_labels.count("umin")
+    n_umax         = side_labels.count("umax")
+    dominant_side  = "umin" if n_umin >= n_umax else "umax"
+
+    return {
+        "side_edge_distance_median": float(statistics.median(dists)),
+        "side_edge_label": dominant_side,
+    }
+
+def candidate_edge_features(
+    building_dict: dict,
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Returns edge-distance features for one candidate.
+    """
+
+    top_dist = candidate_roof_edge_distance_median(building_dict, candidate)
+    side_feats = candidate_side_edge_distance_median(building_dict, candidate)
+
+    return {
+        "dist_to_top_edge_median": top_dist,
+        "dist_to_side_edge_median": side_feats["side_edge_distance_median"],
+        "side_edge_label": side_feats["side_edge_label"],
+    }
+
+def orientation_from_xy_vector(x: float, y: float) -> tuple[Optional[str], Optional[float]]:
+    """
+    Converts XY vector to compass orientation.
+
+    Assumption:
+      +X = East
+      -X = West
+      +Y = North
+      -Y = South
+    """
+    if x is None or y is None:
+        return None, None
+
+    if abs(x) < 1e-9 and abs(y) < 1e-9:
+        return None, None
+
+    angle = math.degrees(math.atan2(y, x))
+
+    directions = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+    idx = int(round(angle / 45.0)) % 8
+
+    return directions[idx], float(angle)
+
+
+def precompute_wall_orientations(
+    building_dict: Dict[str, dict],
+    *,
+    print_debug: bool = False,
+) -> None:
+    """
+    Computes wall orientation from wall['plane']['zaxis']
+    and stores it in-place:
+
+        wall['orientation'] = 'N' / 'NE' / ...
+        wall['orientation_deg'] = angle
+    """
+
+    for wall_id, wall in building_dict.items():
+        if not isinstance(wall, dict) or wall_id.startswith("_"):
+            continue
+
+        zaxis = wall.get("plane", {}).get("zaxis")
+        floor_fn = wall.get("floor_function")
+
+        if not zaxis or len(zaxis) < 2:
+            wall["orientation"] = None
+            wall["orientation_deg"] = None
+            continue
+
+        x = float(zaxis[0])
+        y = float(zaxis[1])
+
+        ori, angle = orientation_from_xy_vector(x, y)
+
+        wall["orientation"] = ori
+        wall["orientation_deg"] = angle
+
+        # if print_debug:
+        #     print(
+        #         wall_id,
+        #         "| floor_function =", floor_fn,
+        #         "| zaxis =", zaxis,
+        #         "->", ori,
+        #         f"({angle:.1f}°)" if angle is not None else ""
+        #     )
+
+def candidate_local_height_stats(
+    building_dict: dict,
+    candidate: dict,
+) -> Dict[str, float]:
+    """
+    Returns candidate height statistics relative to
+    the wall lowest Z value.
+    """
+
+    wall_id = candidate["wall_id"]
+    wall = building_dict.get(wall_id, {})
+
+    xyz = candidate.get("xyz") or []
+
+    if not xyz:
+        return {
+            "mean_height_m": np.nan,
+            "min_height_m": np.nan,
+            "max_height_m": np.nan,
+        }
+
+    # wall local zero
+    grid = wall.get("grid", {}) or {}
+
+    wall_zs = [
+        pdata["point_on_wall"][2]
+        for pdata in grid.values()
+        if isinstance(pdata, dict)
+        and pdata.get("point_on_wall")
+    ]
+
+    if not wall_zs:
+        return {
+            "mean_height_m": np.nan,
+            "min_height_m": np.nan,
+            "max_height_m": np.nan,
+        }
+
+    wall_ground_z = float(np.min(wall_zs))
+
+    zs_local = [
+        float(p[2]) - wall_ground_z
+        for p in xyz
+    ]
+
+    return {
+        "mean_height_m": float(np.mean(zs_local)),
+        "min_height_m": float(np.min(zs_local)),
+        "max_height_m": float(np.max(zs_local)),
+    }

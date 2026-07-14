@@ -1,56 +1,111 @@
-import json
+import re
+import joblib
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
-import re
-from joblib import load
-import multispecies_facades_planner_AI as mcfp
-import inspect
-import streamlit as st
 
-
-from multispecies_facades_planner_AI.facade_planner import (
-    generate_colony_candidates,
-    generate_solitary_candidates,
-)
-from multispecies_facades_planner_AI.facade_planner_trainer_global import score_with_global_ranker_new
+from multispecies_facades_planner_AI import facade_planner_functions as fpf
+from multispecies_facades_planner_AI import data_extraction as de
+from multispecies_facades_planner_AI.data_training_model1_test import plan
+from multispecies_facades_planner_AI.data_training_model1_species_combination import plan_species_combination
 
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "demo_data"
-SPECIES_DIR = DATA_DIR / "species"
-SPECIES_TRAIN_DIR = DATA_DIR / "species_training"
-MODELS_DIR = DATA_DIR / "models"
-MODEL_PATH = MODELS_DIR / "ranker_global_2026-01-31_16-15-48.joblib"
 ICONS_DIR = DATA_DIR / "icons"
 
-@st.cache_resource
-def load_model_pack(path: Path) -> dict:
-    return load(path)
+EXCEL_PATH = DATA_DIR / "bird_species.xlsx"
+XGB_RANKER_PATH = DATA_DIR / "models" / "nestworks_xgb_ranker_reduced.pkl"
+XGB_ENCODERS_PATH = DATA_DIR / "models" / "nestworks_xgb_encoders_reduced.pkl"
+MODEL_TYPE = "xgb"
 
-def render_tag_chips(tags, *, max_tags=4):
-    if not tags:
-        st.caption("Reasons: —")
-        return
-    if isinstance(tags, str):
-        tags_list = [t.strip() for t in tags.split(",") if t.strip()]
-    elif isinstance(tags, list):
-        tags_list = [str(t).strip() for t in tags if str(t).strip()]
-    else:
-        tags_list = []
-    if not tags_list:
-        st.caption("Reasons: —")
-        return
-    tags_list = tags_list[:max_tags]
-    chips = " ".join(
-        [
-            f"<span style='display:inline-block; padding:2px 8px; margin:2px 4px 2px 0; "
-            f"border-radius:999px; background:#eef2ff; color:#1f2937; font-size:12px;'>"
-            f"{t}</span>"
-            for t in tags_list
-        ]
+COLOR_A = "#F4A623"  # orange — best placement (single mode) / species A (combination mode)
+COLOR_B = "#6B3A7D"  # purple — other placement(s) (single mode) / species B (combination mode)
+
+# Max distance (meters) a window/door mesh may fall outside its own wall's mesh
+# bounding box before it's treated as bad export data and skipped entirely —
+# some buildings have openings whose baked mesh doesn't actually sit on the wall.
+OPENING_FIT_TOLERANCE_M = 0.8
+
+BUILDINGS = [
+    {"file": "building4868.json", "street": "Preysingstraße", "house_number": "3", "zip_code": "85049"},
+    {"file": "building5038.json", "street": "Münzbergstraße", "house_number": "16", "zip_code": "85049"},
+    {"file": "building0173.json", "street": "Schäffbräustraße", "house_number": "23", "zip_code": "85049"},
+]
+
+
+def building_address(b: dict) -> str:
+    return f"{b['street']} {b['house_number']}, {b['zip_code']}"
+
+ICON_ALIASES = {"house_sparrow": "sparrow"}
+
+ALLOWED_SPECIES_PAIRS = [
+    ("house_sparrow", "swift"),
+    ("black_redstart", "house_martin"),
+    ("starling", "common_noctule"),
+    ("starling", "common_pipistrelle"),
+    ("swift", "common_noctule"),
+    ("swift", "common_pipistrelle"),
+]
+
+ORDINAL_WALL_LABELS = ["Best wall", "Second best wall", "Third best wall", "Fourth best wall"]
+
+
+def ordinal_wall_label(rank: int) -> str:
+    idx = rank - 1
+    if 0 <= idx < len(ORDINAL_WALL_LABELS):
+        return ORDINAL_WALL_LABELS[idx]
+    return f"{rank}th best wall"
+
+
+def color_dot_html(color: str) -> str:
+    return (
+        f"<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
+        f"background:{color};margin-right:6px;'></span>"
     )
-    st.markdown(f"**Reasons:** {chips}", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# LOADERS
+# ─────────────────────────────────────────────────────────────────
+
+@st.cache_resource
+def load_building(building_path: str) -> dict:
+    building_dict = fpf.load_building_dict(building_path)
+    fpf.precompute_wall_orientations(building_dict)
+    return building_dict
+
+
+@st.cache_resource
+def load_model():
+    model = joblib.load(XGB_RANKER_PATH)
+    encoders = joblib.load(XGB_ENCODERS_PATH)
+    return model, encoders
+
+
+@st.cache_data
+def species_choices() -> list[str]:
+    df = pd.read_excel(EXCEL_PATH)
+    vals = df["specie_name_EN"].dropna().astype(str).str.strip()
+    return sorted({v[: -len("_core")] for v in vals if v.endswith("_core")})
+
+
+@st.cache_data
+def load_needs(species_name: str) -> dict:
+    return de.load_species_training_as_dict(str(EXCEL_PATH), species_name)[species_name]
+
+
+@st.cache_data
+def load_species_icon_bytes(species_name: str) -> bytes | None:
+    stem = ICON_ALIASES.get(species_name, species_name)
+    p = ICONS_DIR / f"{stem}_core.png"
+    return p.read_bytes() if p.exists() else None
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3D VIEW HELPERS (generic over any building_dict)
+# ─────────────────────────────────────────────────────────────────
 
 def triangulate_faces(faces):
     I, J, K = [], [], []
@@ -63,6 +118,7 @@ def triangulate_faces(faces):
             J.append(f[i])
             K.append(f[i + 1])
     return I, J, K
+
 
 def add_mesh(fig, mesh, name, opacity=0.15, color=None):
     V = np.asarray(mesh["vertices"], dtype=float)
@@ -84,6 +140,13 @@ def add_mesh(fig, mesh, name, opacity=0.15, color=None):
         )
     )
 
+
+def opening_mesh_fits_wall(wall_vmin: np.ndarray, wall_vmax: np.ndarray, opening_vertices, tol: float) -> bool:
+    OV = np.asarray(opening_vertices, dtype=float)
+    d = np.maximum(wall_vmin - OV, 0) + np.maximum(OV - wall_vmax, 0)
+    return float(np.linalg.norm(d, axis=1).max()) <= tol
+
+
 def wall_mesh_normal(wall: dict) -> np.ndarray:
     mesh = wall.get("mesh") or {}
     fn = mesh.get("face_normals")
@@ -94,58 +157,6 @@ def wall_mesh_normal(wall: dict) -> np.ndarray:
     n = n / (np.linalg.norm(n) + 1e-12)
     return n
 
-def uv_to_xyz(plane: dict, uv, offset_m: float = 0.0, offset_dir=None):
-    o = np.array(plane["origin"], dtype=float)
-    x = np.array(plane["xaxis"], dtype=float)
-    y = np.array(plane["yaxis"], dtype=float)
-    u, v = float(uv[0]), float(uv[1])
-    p = o + u * x + v * y
-    if offset_m != 0.0 and offset_dir is not None:
-        n = np.asarray(offset_dir, dtype=float)
-        n = n / (np.linalg.norm(n) + 1e-12)
-        p = p + offset_m * n
-    return p
-
-def triangulate_convex_polygon(points_uv):
-    n = len(points_uv)
-    if n < 3:
-        return []
-    return [(0, i, i + 1) for i in range(1, n - 1)]
-
-def add_filled_uv_polygon(
-    fig,
-    plane,
-    poly_uv,
-    name="window",
-    opacity=0.35,
-    color="royalblue",
-    offset_m=0.002,
-    offset_dir=None,
-):
-    P = np.asarray(
-        [uv_to_xyz(plane, uv, offset_m=offset_m, offset_dir=offset_dir) for uv in poly_uv],
-        dtype=float,
-    )
-    faces = triangulate_convex_polygon(poly_uv)
-    if not faces:
-        return
-    i = [a for (a, b, c) in faces]
-    j = [b for (a, b, c) in faces]
-    k = [c for (a, b, c) in faces]
-    fig.add_trace(
-        go.Mesh3d(
-            x=P[:, 0],
-            y=P[:, 1],
-            z=P[:, 2],
-            i=i,
-            j=j,
-            k=k,
-            opacity=opacity,
-            color=color,
-            name=name,
-            showlegend=False,
-        )
-    )
 
 def nice_species_label(stem: str) -> str:
     s = stem
@@ -155,7 +166,8 @@ def nice_species_label(stem: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:1].upper() + s[1:] if s else stem
 
-def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name=""):
+
+def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name="", color=None):
     c = np.asarray(center_xyz, dtype=float)
     ux = np.asarray(plane["xaxis"], dtype=float)
     uy = np.asarray(plane["yaxis"], dtype=float)
@@ -170,17 +182,18 @@ def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name=
             y=pts[:, 1],
             z=pts[:, 2],
             mode="lines",
-            line=dict(width=4),
+            line=dict(width=4, color=color),
             name=name,
             showlegend=False,
         )
     )
 
-def add_candidate_points_and_circles(fig, candidate: dict, walls_data: dict, radius_m=0.10, label="1"):
-    wall_id = candidate["wall_id"]
+
+def add_placement_points_and_circles(fig, placement: dict, walls_data: dict, color: str, radius_m=0.10, label=""):
+    wall_id = placement["wall_id"]
     wall = walls_data.get(wall_id, {})
     plane = wall.get("plane")
-    pts = candidate.get("xyz") or []
+    pts = placement.get("xyz") or []
     if not pts:
         return
     P = np.asarray(pts, dtype=float)
@@ -189,104 +202,16 @@ def add_candidate_points_and_circles(fig, candidate: dict, walls_data: dict, rad
             x=P[:, 0],
             y=P[:, 1],
             z=P[:, 2],
-            mode="markers+text",
-            marker=dict(size=8),
-            name=f"Option {label}",
+            mode="markers",
+            marker=dict(size=8, color=color),
+            name=label,
             showlegend=False,
         )
     )
     if plane:
         for p in pts:
-            add_circle_on_plane(fig, p, plane, radius_m=radius_m, name=f"circle_{label}")
+            add_circle_on_plane(fig, p, plane, radius_m=radius_m, name=f"circle_{label}", color=color)
 
-def load_json_path(p: Path) -> dict:
-    if not p.exists():
-        raise FileNotFoundError(f"Missing file: {p}")
-    return json.loads(p.read_text(encoding="utf-8"))
-
-def unwrap_species_core(species_wrapped: dict, species_key: str) -> dict:
-    if isinstance(species_wrapped, dict):
-        if species_key in species_wrapped and isinstance(species_wrapped[species_key], dict):
-            return species_wrapped[species_key]
-        if len(species_wrapped) == 1:
-            only_key = next(iter(species_wrapped.keys()))
-            if isinstance(species_wrapped[only_key], dict):
-                return species_wrapped[only_key]
-    return species_wrapped
-
-def truthy_yes(v) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return float(v) != 0.0
-    if isinstance(v, str):
-        return v.strip().lower() in {"yes", "y", "true", "1", "ja"}
-    return False
-
-def truthy_no(v) -> bool:
-    if isinstance(v, bool):
-        return not v
-    if isinstance(v, (int, float)):
-        return float(v) == 0.0
-    if isinstance(v, str):
-        return v.strip().lower() in {"no", "n", "false", "0", "nein"}
-    return False
-
-def species_mode_from_core(species_core: dict) -> str:
-    if not isinstance(species_core, dict):
-        return "solitary"
-    for k in ["is_colonial", "is_colonial_bool", "colonial", "is_colony"]:
-        if k in species_core:
-            return "colony" if truthy_yes(species_core.get(k)) else "solitary"
-    for k in ["colonie", "colony"]:
-        if k in species_core:
-            v = species_core.get(k)
-            if truthy_yes(v):
-                return "colony"
-            if truthy_no(v):
-                return "solitary"
-    if species_core.get("colonie_size") is not None or species_core.get("colony_size") is not None:
-        return "colony"
-    if "if_colonial_distance_to_next_nest" in species_core:
-        return "colony"
-    return "solitary"
-
-def find_training_species_file(species_id: str, species_key: str) -> Path | None:
-    candidates = [
-        f"{species_id}_core_training",
-        f"{species_key}_core_training",
-        f"{species_id}_training",
-        f"{species_key}_training",
-    ]
-    for name in candidates:
-        p_json = SPECIES_TRAIN_DIR / f"{name}.json"
-        p_noext = SPECIES_TRAIN_DIR / name
-        if p_json.exists():
-            return p_json
-        if p_noext.exists():
-            return p_noext
-    if SPECIES_TRAIN_DIR.exists():
-        all_files = list(SPECIES_TRAIN_DIR.glob("*.json")) + [
-            p for p in SPECIES_TRAIN_DIR.iterdir() if p.is_file() and p.suffix == ""
-        ]
-        sid = (species_id or "").lower()
-        sk = (species_key or "").lower()
-        scored = []
-        for p in all_files:
-            st_ = p.stem.lower()
-            if "training" not in st_:
-                continue
-            score = 0
-            if sid and sid in st_:
-                score += 2
-            if sk and sk in st_:
-                score += 1
-            if score > 0:
-                scored.append((score, p))
-        if scored:
-            scored.sort(key=lambda t: (-t[0], len(t[1].stem)))
-            return scored[0][1]
-    return None
 
 def add_wall_floor_function_labels(
     fig,
@@ -298,6 +223,8 @@ def add_wall_floor_function_labels(
     # estimate a "ground" z from all wall meshes
     zs = []
     for w in walls_data.values():
+        if not isinstance(w, dict):
+            continue
         m = w.get("mesh") or {}
         V = m.get("vertices") or []
         if V:
@@ -306,8 +233,13 @@ def add_wall_floor_function_labels(
     label_z = ground_z + float(z_lift_m)
 
     for wall_id, wall in walls_data.items():
-        ff = wall.get("floor_function", None)
-        if ff is None or str(ff).strip() == "":
+        if not isinstance(wall, dict):
+            continue
+        ff = wall.get("floor_function")
+        orientation = wall.get("orientation")
+        has_ff = bool(ff and str(ff).strip())
+        has_ori = bool(orientation and str(orientation).strip())
+        if not has_ff and not has_ori:
             continue
 
         mesh = wall.get("mesh") or {}
@@ -331,296 +263,233 @@ def add_wall_floor_function_labels(
         p = c + offset_xy_m * d
         p[2] = label_z  # force onto "XY plane"
 
-        fig.add_trace(
-            go.Scatter3d(
-                x=[p[0]],
-                y=[p[1]],
-                z=[p[2]],
-                mode="text",
-                text=[str(ff)],
-                textposition="middle center",
-                showlegend=False,
-                name=f"ff_{wall_id}",
+        # orientation stacks directly below floor_function, both centered on the same
+        # (x, y) so the two lines read as one label rather than a single \n-joined
+        # string (Scatter3d text doesn't render embedded newlines as separate lines).
+        line_gap_m = 1.6
+        half_gap = line_gap_m / 2.0 if (has_ff and has_ori) else 0.0
+        if has_ff:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[p[0]], y=[p[1]], z=[p[2] + half_gap],
+                    mode="text",
+                    text=[str(ff)],
+                    textposition="middle center",
+                    showlegend=False,
+                    name=f"ff_{wall_id}",
+                )
             )
-        )
+        if has_ori:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[p[0]], y=[p[1]], z=[p[2] - half_gap],
+                    mode="text",
+                    text=[str(orientation).upper()],
+                    textposition="middle center",
+                    showlegend=False,
+                    name=f"ori_{wall_id}",
+                )
+            )
 
-@st.cache_data
-def load_json_file(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-@st.cache_data
-def load_json(filename: str) -> dict:
-    return load_json_file(DATA_DIR / filename)
-
-@st.cache_data
-def load_species(species_id: str) -> dict:
-    path = SPECIES_DIR / f"{species_id}.json"
-    if not path.exists():
-        raise FileNotFoundError(path)
-    return load_json_file(path)
-
-@st.cache_data
-def load_species_icon_bytes(species_id: str) -> bytes | None:
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = ICONS_DIR / f"{species_id}{ext}"
-        if p.exists():
-            return p.read_bytes()
-    return None
 
 @st.cache_resource
-def build_base_figure(walls_data: dict, roof_mesh: dict) -> go.Figure:
+def build_base_figure(walls_data: dict) -> go.Figure:
     fig = go.Figure()
     for wall_id, wall in walls_data.items():
-        if "mesh" not in wall:
+        if not isinstance(wall, dict) or "mesh" not in wall:
             continue
+
+        if wall.get("type") == "roof":
+            add_mesh(fig, wall["mesh"], name=wall_id, opacity=1, color="lightgrey")
+            continue
+
         add_mesh(fig, wall["mesh"], name=wall_id, opacity=0.3, color="lightblue")
-        plane = wall.get("plane")
         wins = wall.get("windows") or {}
         doors = wall.get("doors") or {}
-        n_wall = wall_mesh_normal(wall)
-        if plane and isinstance(wins, dict):
+        wall_V = np.asarray(wall["mesh"]["vertices"], dtype=float)
+        wall_vmin, wall_vmax = wall_V.min(axis=0), wall_V.max(axis=0)
+        # Drawn from each opening's own baked mesh (world-space, already correctly
+        # positioned) rather than reconstructed from hull_uv + the wall's plane —
+        # some walls' window/door hull_uv doesn't line up with their own plane,
+        # which sent those openings flying off into space. The PDF exporter
+        # (facade_planner_visAI._add_scene) already draws openings this same way.
+        # Openings whose mesh still doesn't actually sit on the wall (bad export
+        # data, e.g. building0173) are skipped entirely rather than drawn wrong.
+        if isinstance(wins, dict):
             for win_id, win in wins.items():
-                hull_uv = win.get("hull_uv")
-                if hull_uv and len(hull_uv) >= 3:
-                    add_filled_uv_polygon(
-                        fig,
-                        plane,
-                        hull_uv,
-                        name=f"{wall_id}:{win_id}",
-                        opacity=0.3,
-                        offset_m=0.05,
-                        offset_dir=n_wall,
-                        color="royalblue",
-                    )
-        if plane and isinstance(doors, dict):
+                m = win.get("mesh")
+                if m and m.get("vertices") and opening_mesh_fits_wall(
+                    wall_vmin, wall_vmax, m["vertices"], OPENING_FIT_TOLERANCE_M
+                ):
+                    add_mesh(fig, m, name=f"{wall_id}:{win_id}", opacity=0.45, color="royalblue")
+        if isinstance(doors, dict):
             for door_id, door in doors.items():
-                hull_uv = door.get("hull_uv")
-                if hull_uv and len(hull_uv) >= 3:
-                    add_filled_uv_polygon(
-                        fig,
-                        plane,
-                        hull_uv,
-                        name=f"{wall_id}:{door_id}",
-                        opacity=0.35,
-                        offset_m=0.002,
-                        offset_dir=n_wall,
-                        color="royalblue",
-                    )
-    add_mesh(fig, roof_mesh, name="roof", opacity=1, color="lightgrey")
+                m = door.get("mesh")
+                if m and m.get("vertices") and opening_mesh_fits_wall(
+                    wall_vmin, wall_vmax, m["vertices"], OPENING_FIT_TOLERANCE_M
+                ):
+                    add_mesh(fig, m, name=f"{wall_id}:{door_id}", opacity=0.45, color="royalblue")
     add_wall_floor_function_labels(fig, walls_data, offset_xy_m=1.5, z_lift_m=0.2)
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), scene=dict(aspectmode="data"))
     return fig
 
-st.set_page_config(layout="wide")
-st.title("NestWorks– demo")
 
-if not MODEL_PATH.exists():
-    st.error(f"Model file missing: {MODEL_PATH}")
-    st.stop()
-_ = load_model_pack(MODEL_PATH)
-
-BUILDING_ADDRESS = "Am Bachl 30, 85049 Ingolstadt"
-st.sidebar.header("Building address:")
-st.sidebar.caption(BUILDING_ADDRESS)
-st.sidebar.header("Species selection")
-
-species_files = sorted(p.stem for p in SPECIES_DIR.glob("*.json"))
-if not species_files:
-    st.sidebar.error(f"No species .json files found in: {SPECIES_DIR}")
-    st.stop()
-
-species_id = st.sidebar.selectbox(
-    "Species",
-    species_files,
-    format_func=nice_species_label,
-    key="species_selectbox",
-)
-
-if "prev_species_id" not in st.session_state:
-    st.session_state.prev_species_id = species_id
-if st.session_state.prev_species_id != species_id:
-    st.session_state.prev_species_id = species_id
-    for k in ["top3", "selected_option_idx", "top3_meta"]:
-        if k in st.session_state:
-            del st.session_state[k]
-
-run = st.sidebar.button("Generate options", key="generate_btn")
-
-_ = load_species(species_id)
-species_key = nice_species_label(species_id).lower().replace(" ", "_")
-
-walls_data = load_json("building.json")
-roof_mesh = load_json("building5128_roofs.json")
-
-base_fig = build_base_figure(walls_data, roof_mesh)
-fig = go.Figure(base_fig)
-
-fig_ph = st.empty()
-
-if run:
-    try:
-        training_path = find_training_species_file(species_id=species_id, species_key=species_key)
-        if training_path is None:
-            available = sorted([p.name for p in SPECIES_TRAIN_DIR.iterdir()]) if SPECIES_TRAIN_DIR.exists() else []
-            st.sidebar.error(
-                "Could not find training species file.\n\n"
-                f"species_id: {species_id}\n"
-                f"species_key: {species_key}\n\n"
-                f"Available in species_training:\n{available}"
-            )
-            st.stop()
-        species_training_wrapped = load_json_path(training_path)
-        species_training_core = unwrap_species_core(species_training_wrapped, species_key)
-    except Exception as e:
-        st.sidebar.error(f"Failed loading training species file: {e}")
-        st.stop()
-
-    mode = species_mode_from_core(species_training_core)
-    specie_needs_for_generation = {species_key: species_training_core}
-
-    with st.spinner(f"Generating placement options for {nice_species_label(species_id)} ({mode} specie)..."):
-        if mode == "colony":
-            candidates = generate_colony_candidates(
-                building_dict=walls_data,
-                specie_needs=specie_needs_for_generation,
-                specie_colonies=1,
-                attempts_per_wall=35,
-                low_band_m=3.0,
-                high_band_m=10.0,
-                max_candidates_per_wall=10,
-                base_seed=42,
-            )
-        else:
-            candidates = generate_solitary_candidates(
-                building_dict=walls_data,
-                specie_needs=specie_needs_for_generation,
-                attempts_per_wall=35,
-                low_band_m=3.0,
-                high_band_m=10.0,
-                max_candidates_per_wall=20,
-                base_seed=42,
-                min_nests_per_wall=1,
-                max_nests_per_wall=10,
-                min_pair_distance_m=10.0,
-            )
-
-    if not candidates:
-        st.warning("No candidates generated.")
-        st.stop()
-
-    try:
-        from multispecies_facades_planner_AI.facade_planner_feature import build_feature_table
-    except Exception as e:
-        st.error(f"Could not import build_feature_table: {e}")
-        st.stop()
-
-    with st.spinner("Building feature table..."):
-        df_features = build_feature_table(
-            candidates=candidates,
-            building_dict=walls_data,
-            species_dict={species_key: species_training_core},
-            iteration_id="demo",
-            building_id="5128",
-        )
-
-    if df_features is None or len(df_features) == 0:
-        st.warning("Feature table is empty.")
-        st.stop()
-
-    with st.spinner("Scoring with global ranker..."):
-        scored_df = score_with_global_ranker_new(
-            df_features=df_features,
-            model_path=MODEL_PATH,
-            top_k_tags=4,
-            tag_min_p=0.1,
-        )
-
-    score_col = None
-    for c in ["ml_score", "score", "rank_score", "pred", "prediction"]:
-        if c in scored_df.columns:
-            score_col = c
-            break
-    if score_col is None:
-        st.error(f"Could not find a score column in ranker output. Columns: {list(scored_df.columns)}")
-        st.stop()
-
-    if "candidate_id" not in scored_df.columns:
-        st.error(f"Ranker output is missing 'candidate_id'. Columns: {list(scored_df.columns)}")
-        st.stop()
-
-    cand_by_id = {c["candidate_id"]: c for c in candidates if "candidate_id" in c}
-    top3_ids = scored_df.sort_values(score_col, ascending=False).head(3)["candidate_id"].tolist()
-    top3 = [cand_by_id.get(cid) for cid in top3_ids if cid in cand_by_id]
-
-    if not top3:
-        st.warning("Top-3 candidates could not be matched back to generated candidates.")
-        st.stop()
-
-    # CHANGE: update icon species ONLY when Generate options is clicked
-    st.session_state.generated_species_id = species_id
-    # (optional) cache icon bytes for that generated species, to avoid re-reading file on reruns
-    st.session_state.generated_species_icon_bytes = load_species_icon_bytes(species_id)
-
-    st.session_state.top3 = top3
-    st.session_state.selected_option_idx = 0
-
-    meta = {}
-    for cid in top3_ids:
-        row = scored_df[scored_df["candidate_id"] == cid].head(1)
-        if len(row) == 0:
-            continue
-        r0 = row.iloc[0]
-        meta[cid] = {
-            "score": float(r0[score_col]) if score_col in r0 else None,
-            "predicted_tags": r0.get("predicted_tags", []),
-            "predicted_tags_str": r0.get("predicted_tags_str", ""),
-        }
-    st.session_state.top3_meta = meta
-
-if "top3" in st.session_state and st.session_state.top3:
-    st.sidebar.header("Results")
-    option_labels = ["Option 1 (best)", "Option 2", "Option 3"]
-
-    current_idx = int(st.session_state.get("selected_option_idx", 0))
-    picked = st.sidebar.radio(
-        "Show option",
-        option_labels[: len(st.session_state.top3)],
-        index=min(current_idx, len(st.session_state.top3) - 1),
-        horizontal=True,
-        key="results_option_radio",
+def placement_caption(walls_data: dict, p: dict) -> str:
+    wall = walls_data.get(p["wall_id"], {})
+    orientation = wall.get("orientation") or "–"
+    shared = f" · shared wall with {nice_species_label(p['shared_wall_with'])}" if p.get("shared_wall_with") else ""
+    return (
+        f"Orientation: {orientation} · "
+        f"Sector: {p['section_row']}/{p['section_col']} · "
+        f"Nests: {p['colony_size']} · Score: {p['placement_score']:.3f}{shared}"
     )
-    pick_idx = option_labels.index(picked)
-    st.session_state.selected_option_idx = pick_idx
 
-    sel = st.session_state.top3[pick_idx]
 
-    meta = st.session_state.get("top3_meta", {}) or {}
-    cid = sel.get("candidate_id")
-    m = meta.get(cid, {}) if cid else {}
+# ─────────────────────────────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────────────────────────────
 
-    if m.get("score") is not None:
-        st.sidebar.metric("ML score", f"{m['score']:.3f}")
-    else:
-        st.sidebar.caption("ML score: —")
+st.set_page_config(layout="wide")
+st.title("NestWorks – demo")
 
-    st.sidebar.write("")
-    tags_payload = m.get("predicted_tags") or m.get("predicted_tags_str", "")
-    with st.sidebar:
-        render_tag_chips(tags_payload, max_tags=4)
+if not XGB_RANKER_PATH.exists() or not XGB_ENCODERS_PATH.exists():
+    st.error(f"Model files missing under: {XGB_RANKER_PATH.parent}")
+    st.stop()
 
-    add_candidate_points_and_circles(fig, sel, walls_data, label=str(pick_idx + 1), radius_m=0.10)
+st.sidebar.header("Buildings Ingolstadt")
+building_labels = [building_address(b) for b in BUILDINGS]
+picked_building_label = st.sidebar.selectbox("Building", building_labels, key="building_picker")
+building = BUILDINGS[building_labels.index(picked_building_label)]
+building_path = DATA_DIR / building["file"]
+
+if not building_path.exists():
+    st.error(f"Building file missing: {building_path}")
+    st.stop()
+
+# switching buildings invalidates any previously generated placements — their
+# wall IDs and coordinates belong to a different building's geometry.
+if st.session_state.get("prev_building_file") != building["file"]:
+    st.session_state.prev_building_file = building["file"]
+    for k in ["single_options", "combo_result"]:
+        st.session_state.pop(k, None)
+
+walls_data = load_building(str(building_path))
+model, xgb_encoders = load_model()
+species_list = species_choices()
+
+mode = st.sidebar.radio("Planning mode", ["Single species", "Two species (combination)"])
+
+base_fig = build_base_figure(walls_data)
+fig = go.Figure(base_fig)
+fig_ph = st.empty()
+icon_bytes_row: list[bytes] = []
+
+if mode == "Single species":
+    st.sidebar.header("Species selection")
+    species_name = st.sidebar.selectbox("Species", species_list, format_func=nice_species_label)
+    run = st.sidebar.button("Generate options", key="generate_single")
+
+    if run:
+        needs = load_needs(species_name)
+        with st.spinner(f"Planning placements for {nice_species_label(species_name)}..."):
+            options = plan(
+                model=model,
+                building_dict=walls_data,
+                species_name=species_name,
+                needs=needs,
+                n_options=2,
+                model_type=MODEL_TYPE,
+                xgb_encoders=xgb_encoders,
+            )
+        st.session_state.single_species = species_name
+        st.session_state.single_options = options
+        st.session_state.single_option_idx = 0
+
+    if st.session_state.get("single_options"):
+        options = st.session_state.single_options
+        option_labels = ["Option 1 (best)", "Option 2"][: len(options)]
+
+        st.sidebar.header("Results")
+        current_idx = min(st.session_state.get("single_option_idx", 0), len(options) - 1)
+        picked = st.sidebar.radio(
+            "Show option", option_labels, index=current_idx, horizontal=True, key="single_option_radio"
+        )
+        pick_idx = option_labels.index(picked)
+        st.session_state.single_option_idx = pick_idx
+
+        option = options[pick_idx]
+        placements = option["placements"]
+        rank_order = sorted(range(len(placements)), key=lambda i: placements[i]["placement_score"], reverse=True)
+        for rank, p_idx in enumerate(rank_order, start=1):
+            placement = placements[p_idx]
+            color = COLOR_A if rank == 1 else COLOR_B
+            label = ordinal_wall_label(rank)
+            add_placement_points_and_circles(fig, placement, walls_data, color=color, label=label)
+            st.sidebar.markdown(f"{color_dot_html(color)}**{label}**", unsafe_allow_html=True)
+            st.sidebar.caption(placement_caption(walls_data, placement))
+
+        icon_bytes = load_species_icon_bytes(st.session_state.single_species)
+        if icon_bytes:
+            icon_bytes_row = [icon_bytes]
+
+else:
+    st.sidebar.header("Species selection")
+    pair_labels = [f"{nice_species_label(a)} + {nice_species_label(b)}" for a, b in ALLOWED_SPECIES_PAIRS]
+    picked_pair_label = st.sidebar.selectbox("Species pair", pair_labels, key="species_pair")
+    species_a, species_b = ALLOWED_SPECIES_PAIRS[pair_labels.index(picked_pair_label)]
+    run = st.sidebar.button("Generate options", key="generate_combo")
+
+    if run:
+        needs_a = load_needs(species_a)
+        needs_b = load_needs(species_b)
+        with st.spinner(
+            f"Planning placements for {nice_species_label(species_a)} + {nice_species_label(species_b)}..."
+        ):
+            combination_result = plan_species_combination(
+                model=model,
+                building_dict=walls_data,
+                species1_name=species_a,
+                needs1=needs_a,
+                species2_name=species_b,
+                needs2=needs_b,
+                model_type=MODEL_TYPE,
+                xgb_encoders=xgb_encoders,
+            )
+        st.session_state.combo_species = (species_a, species_b)
+        st.session_state.combo_result = combination_result
+
+    if st.session_state.get("combo_result"):
+        sp_a, sp_b = st.session_state.combo_species
+        combination_result = st.session_state.combo_result
+
+        st.sidebar.header("Results")
+        for sp_name, color in [(sp_a, COLOR_A), (sp_b, COLOR_B)]:
+            st.sidebar.markdown(f"{color_dot_html(color)}**{nice_species_label(sp_name)}**", unsafe_allow_html=True)
+            placements = combination_result.get(sp_name, [])
+            if not placements:
+                st.sidebar.caption("No placement found.")
+                continue
+            for placement in placements:
+                add_placement_points_and_circles(
+                    fig, placement, walls_data, color=color, label=nice_species_label(sp_name)
+                )
+                st.sidebar.caption(placement_caption(walls_data, placement))
+
+        for sp_name in (sp_a, sp_b):
+            icon_bytes = load_species_icon_bytes(sp_name)
+            if icon_bytes:
+                icon_bytes_row.append(icon_bytes)
 
 # --- 3D VIEW ---
 fig_ph.plotly_chart(fig, use_container_width=True, key="main_3d")
 st.markdown("<div style='height:80px'></div>", unsafe_allow_html=True)
 
-# --- ICON ALWAYS BELOW THE 3D VIEW ---
+# --- ICON ROW BELOW THE 3D VIEW ---
 with st.container():
-    # CHANGE: use generated species icon only (updates only after Generate options)
-    icon_bytes = st.session_state.get("generated_species_icon_bytes", None)
-    if icon_bytes:
-        c1, c2, c3 = st.columns([3, 1, 3])
-        with c2:
-            st.image(icon_bytes, width=72)
+    if icon_bytes_row:
+        cols = st.columns([3] + [1] * len(icon_bytes_row) + [3])
+        for col, icon_bytes in zip(cols[1:-1], icon_bytes_row):
+            with col:
+                st.image(icon_bytes, width=72)
     else:
         st.caption("")
