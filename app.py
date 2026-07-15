@@ -84,11 +84,30 @@ def load_model():
     return model, encoders
 
 
+SINGLE_SPECIES_ALLOWLIST = {
+    "house_sparrow",
+    "swift",
+    "house_martin",
+    "spotted_flycatcher",
+    "robin",
+    "wagtail",
+    "great_tit",
+    "blue_tit",
+    "tree_sparrow",
+    "black_redstart",
+    "starling",
+    "jackdaw",
+    "common_noctule",
+    "common_pipistrelle",
+}
+
+
 @st.cache_data
 def species_choices() -> list[str]:
     df = pd.read_excel(EXCEL_PATH)
     vals = df["specie_name_EN"].dropna().astype(str).str.strip()
-    return sorted({v[: -len("_core")] for v in vals if v.endswith("_core")})
+    all_species = {v[: -len("_core")] for v in vals if v.endswith("_core")}
+    return sorted(all_species & SINGLE_SPECIES_ALLOWLIST)
 
 
 @st.cache_data
