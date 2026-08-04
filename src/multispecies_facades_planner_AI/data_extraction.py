@@ -49,6 +49,8 @@ def load_species_core_as_dict(
             "if_colonial_distance_to_next_nest",
             "colonie_size",
             "diet_type",
+            "distance_to_roof",
+            "far_from_windows",
         ]
 
     df = pd.read_excel(excel_path)
@@ -115,7 +117,8 @@ def load_species_training_as_dict(
  
             "distance_to_edges",
             "distance_to_roof",
- 
+            "far_from_windows",
+
             "time_activity",
             "nest_use_window",
             "temperature_optimum_in_nest_box",

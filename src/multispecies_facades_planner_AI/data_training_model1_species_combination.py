@@ -161,7 +161,7 @@ def _rank_viable_walls_for_species(
                 building_dict=building_dict, wall_id=wid,
                 sector_row=sr, sector_col=sc,
                 min_height_m=height_min, max_height_m=height_max,
-                usable_geom=usable_geom, building_zero_z=building_zero_z,
+                usable_geom=usable_geom, needs=needs,
             )) >= colony_min
             for sr, sc in all_sectors
         )
@@ -226,7 +226,7 @@ def _feasible_scored_sectors(
             building_dict=building_dict, wall_id=wall_id,
             sector_row=sr, sector_col=sc,
             min_height_m=height_min, max_height_m=height_max,
-            usable_geom=usable_geom, building_zero_z=building_zero_z,
+            usable_geom=usable_geom, needs=needs,
         )
         if len(pts) >= colony_min:
             sectors.append((sr, sc, pts))
@@ -422,7 +422,7 @@ def _place_one_species_avoiding_other(
         pts = _get_sector_feasible_points(
             building_dict=building_dict, wall_id=wall_id, sector_row=sr, sector_col=sc,
             min_height_m=height_min, max_height_m=height_max,
-            usable_geom=usable_geom, building_zero_z=building_zero_z,
+            usable_geom=usable_geom, needs=needs,
         )
         if not pts:
             continue

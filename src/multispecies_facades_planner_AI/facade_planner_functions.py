@@ -48,6 +48,41 @@ def free_wall_area(wall: dict) -> float:
     return max(0.0, free_area)  
 
 
+def wall_height_m(wall: dict) -> Optional[float]:
+    """
+    Returns the wall's own vertical extent (max_z - min_z), in metres — e.g.
+    10 or 20m. This is relative to the wall itself, not the building's
+    absolute world Z coordinates (which can be arbitrary, e.g. 550m), so a
+    model can learn "placed low *for this wall's height*" separately from
+    "the wall itself is short".
+
+    For triangular-top (gable) walls, the sampled grid can fall short of the
+    actual roof apex, so the highest point is taken from the wall's mesh
+    vertices instead — that's the true geometry, not just where nest points
+    happen to be sampled.
+    """
+    grid = wall.get("grid") or {}
+    zs = [
+        float(pdata["point_on_wall"][2])
+        for pdata in grid.values()
+        if isinstance(pdata, dict) and pdata.get("point_on_wall")
+    ]
+    if not zs:
+        return None
+
+    z_min = min(zs)
+    z_max = max(zs)
+
+    wall_shape = str(wall.get("wall_shape") or "").strip().lower()
+    if "triangular" in wall_shape:
+        mesh_verts = (wall.get("mesh") or {}).get("vertices") or []
+        mesh_zs = [float(v[2]) for v in mesh_verts if len(v) > 2]
+        if mesh_zs:
+            z_max = max(z_max, max(mesh_zs))
+
+    return float(z_max - z_min)
+
+
 def wall_with_max_free_area(building_dict: dict):
     """
     Returns (wall_id, max_free_area).
@@ -98,12 +133,101 @@ def derive_openings(wall: dict):
     holes = unary_union(opening_polys)
     return wall_poly.difference(holes)
 
+def _window_v_extent(hull_uv):
+    if not hull_uv or len(hull_uv) < 3:
+        return None
+    vs = [p[1] for p in hull_uv]
+    return min(vs), max(vs)
+
+
+def _group_window_floors(windows: dict, v_up: bool, floor_gap_tol_m: float = 1.0):
+    """
+    Clusters windows on one wall into floor bands by vertical (V) position,
+    ordered bottom -> top. A window joins the previous floor band if its
+    V-center is within floor_gap_tol_m of it — same-floor windows share
+    ~the same sill height, while floor-to-floor spacing is a few metres, so
+    a 1m tolerance cleanly separates floors without needing real floor data.
+
+    Returns a list of floor bands: [{"window_ids": [...], "tops": [...]}]
+    "tops" holds each window's upper-edge V coordinate (op_max_v if v_up
+    else op_min_v) — used to anchor the no-nest strip on the floor below at
+    the actual top line of the windows above it, not a height offset.
+    """
+    entries = []
+    for win_id, win in (windows or {}).items():
+        ext = _window_v_extent(win.get("hull_uv"))
+        if ext is None:
+            continue
+        v_min, v_max = ext
+        v_center = (v_min + v_max) / 2.0
+        order_key = v_center if v_up else -v_center
+        top_v = v_max if v_up else v_min
+        entries.append((order_key, win_id, top_v))
+
+    entries.sort(key=lambda e: e[0])
+
+    floors = []
+    for order_key, win_id, top_v in entries:
+        if floors and (order_key - floors[-1]["_order_key"]) <= floor_gap_tol_m:
+            floor = floors[-1]
+            floor["window_ids"].append(win_id)
+            floor["tops"].append(top_v)
+            floor["_order_key"] = order_key
+        else:
+            floors.append({
+                "window_ids": [win_id],
+                "tops": [top_v],
+                "_order_key": order_key,
+            })
+
+    return floors
+
+
+def _window_floor_index(floors, win_id):
+    for i, floor in enumerate(floors):
+        if win_id in floor["window_ids"]:
+            return i
+    return None
+
+
+def v_axis_points_up(wall: dict) -> bool:
+    """
+    True if the wall's local +V axis corresponds to +worldZ (up).
+
+    Roughly half of all walls store plane.yaxis = (x, y, -1), i.e. V increases
+    *downwards* — opposite facades of a building get opposite parametrisation.
+    Anything that reasons about "up", "top" or "the roofline" in UV space must
+    consult this first, or it silently operates on the bottom of the wall.
+
+    Falls back to True when no usable yaxis is stored.
+    """
+    pl = wall.get("plane") or {}
+    y = pl.get("yaxis") or pl.get("YAxis")  # be flexible
+    if not y or len(y) != 3:
+        return True
+    # dot(yaxis, worldZ) > 0 means v increases upward
+    return bool(y[2] > 0)
+
+
 def build_offset_area(
     wall: dict,
-    win_side_offset: float = 0.2,
+    win_side_offset: float = 0.35,
     door_side_offset: float = 0.4,
     join_style: int = 2,
+    floor_gap_tol_m: float = 1.0,
 ):
+    """
+    Hard-constraint no-nest area around windows and doors.
+
+    Windows (all species):
+      - side_offset (both sides) = win_side_offset (35cm by default).
+      - the exclusion strip above a window normally only runs up to the top
+        edge (V-coordinate) of the window directly above it on the next
+        floor up (windows are clustered into floor bands by vertical
+        position, see _group_window_floors) — not all the way to the roof.
+      - for windows on the topmost floor band (no floor above), the strip
+        runs all the way up to the wall's top boundary (the roof).
+    """
     wall_uv = wall.get("boundary_uv")
     if not wall_uv or len(wall_uv) < 3:
         return Polygon()
@@ -114,24 +238,12 @@ def build_offset_area(
 
     min_u, min_v, max_u, max_v = wall_poly.bounds
 
-    def v_axis_points_up(wall: dict) -> bool:
-        """
-        Returns True if +V corresponds to +worldZ (up).
-        Expects something like:
-          wall["plane"]["yaxis"] = (x,y,z)
-        Adapt this accessor to your actual stored structure.
-        """
-        pl = wall.get("plane") or {}
-        y = pl.get("yaxis") or pl.get("YAxis")  # be flexible
-        if not y or len(y) != 3:
-            # Fallback: assume the old behavior (+V is up)
-            return True
-        # dot(yaxis, worldZ) > 0 means v increases upward
-        return (y[2] > 0)
-
     v_up = v_axis_points_up(wall)
 
-    def opening_offset_geom(opening_uv, side_offset):
+    windows = wall.get("windows") or {}
+    window_floors = _group_window_floors(windows, v_up, floor_gap_tol_m=floor_gap_tol_m)
+
+    def opening_offset_geom(opening_uv, side_offset, next_floor_top_v=None):
         if not opening_uv or len(opening_uv) < 3:
             return None
 
@@ -156,8 +268,18 @@ def build_offset_area(
         if (v_up and opening_top_v >= wall_top_v) or ((not v_up) and opening_top_v <= wall_top_v):
             above_strip = Polygon()
         else:
-            # Build strip from opening_top_v toward wall_top_v
-            v0, v1 = sorted([opening_top_v, wall_top_v])
+            if next_floor_top_v is None:
+                # top floor (or no floor above) -> exclusion runs to the roof
+                strip_top_v = wall_top_v
+            else:
+                # exclusion runs up to the next floor window's own top edge,
+                # clamped so it never falls short of this opening or past the wall
+                strip_top_v = (
+                    min(max(next_floor_top_v, opening_top_v), wall_top_v) if v_up
+                    else max(min(next_floor_top_v, opening_top_v), wall_top_v)
+                )
+
+            v0, v1 = sorted([opening_top_v, strip_top_v])
             above_strip = box(
                 op_min_u - side_offset,
                 v0,
@@ -172,13 +294,22 @@ def build_offset_area(
 
     pieces = []
 
-    for win in (wall.get("windows") or {}).values():
-        g = opening_offset_geom(win.get("hull_uv"), win_side_offset)
+    for win_id, win in windows.items():
+        floor_idx = _window_floor_index(window_floors, win_id)
+        next_floor_top_v = None
+        if floor_idx is not None and floor_idx < len(window_floors) - 1:
+            next_tops = window_floors[floor_idx + 1]["tops"]
+            if next_tops:
+                # the outermost top line among the next floor's windows, so the
+                # strip never falls short of any of them
+                next_floor_top_v = max(next_tops) if v_up else min(next_tops)
+
+        g = opening_offset_geom(win.get("hull_uv"), win_side_offset, next_floor_top_v=next_floor_top_v)
         if g and not g.is_empty:
             pieces.append(g)
 
     for dr in (wall.get("doors") or {}).values():
-        g = opening_offset_geom(dr.get("hull_uv"), door_side_offset)
+        g = opening_offset_geom(dr.get("hull_uv"), door_side_offset, next_floor_top_v=None)
         if g and not g.is_empty:
             pieces.append(g)
 
@@ -410,6 +541,7 @@ def pick_points_chained_band(
     dmin_m,
     dmax_m,
     max_tries_per_step=400,
+    rng=None,
 ):
     """
     candidates: list of (pid, uv, xyz)
@@ -418,16 +550,24 @@ def pick_points_chained_band(
       - Next point: distance to previous point in [dmin_m, dmax_m]
       - And distance to ALL earlier points >= dmin_m
     Returns list of selected (pid, uv, xyz)
+
+    rng: pass the caller's seeded random.Random so the placement is
+    reproducible. This function decides where the nests actually go, so if it
+    draws from the global `random` module instead, the seed threaded through
+    the whole generator has no effect on the output. Defaults to the global
+    module only to preserve behaviour for unseeded callers.
     """
 
     if not candidates or target_size <= 0:
         return []
 
+    rng = rng if rng is not None else random
+
     # index for random sampling
     cand = list(candidates)
 
     # 1) pick first point randomly
-    first = random.choice(cand)
+    first = rng.choice(cand)
     selected = [first]
     selected_uvs = [first[1]]
 
@@ -441,7 +581,7 @@ def pick_points_chained_band(
         # try random candidates until one fits the rules
         picked = None
         for _ in range(max_tries_per_step):
-            c = random.choice(cand)
+            c = rng.choice(cand)
             uv = c[1]
 
             d_prev = dist_uv(uv, prev_uv)
@@ -775,11 +915,17 @@ def sector_3x3_labels(
     u: float,
     v: float,
     bbox: Tuple[float, float, float, float],
+    v_up: bool = True,
 ) -> Tuple[str, str]:
     """
     Returns categorical sector labels:
       section_row: 'bottom' / 'middle' / 'top'
       section_col: 'left' / 'middle' / 'right'
+
+    v_up says which V direction is physically up on this wall (see
+    v_axis_points_up). On a wall whose V axis points down the normalised
+    position is mirrored, otherwise a nest directly under the roof would be
+    labelled 'bottom'.
     """
     umin, vmin, umax, vmax = bbox
 
@@ -788,6 +934,9 @@ def sector_3x3_labels(
 
     un = (u - umin) / du
     vn = (v - vmin) / dv
+
+    if not v_up:
+        vn = 1.0 - vn
 
     # clamp to [0,1)
     un = min(max(un, 0.0), 0.999999)
@@ -816,7 +965,8 @@ def sector_features_3x3(building_dict: dict, candidate: Dict[str, Any]) -> Dict[
             "section_col": None,
         }
 
-    row_label, col_label = sector_3x3_labels(uv[0], uv[1], bbox)
+    v_up = v_axis_points_up(building_dict.get(wall_id) or {})
+    row_label, col_label = sector_3x3_labels(uv[0], uv[1], bbox, v_up=v_up)
 
     return {
         "section_row": row_label,
@@ -848,6 +998,7 @@ def precompute_wall_climate_features(building_dict: Dict[str, dict]) -> None:
             continue
 
         sector_values: Dict[str, list] = {}
+        v_up = v_axis_points_up(wall)
 
         for pt in (wall.get("grid") or {}).values():
             uv      = pt.get("uv")          # [u, v] in world-scale UV space
@@ -858,7 +1009,7 @@ def precompute_wall_climate_features(building_dict: Dict[str, dict]) -> None:
 
             u, v = float(uv[0]), float(uv[1])
 
-            row_label, col_label = sector_3x3_labels(u, v, bbox)
+            row_label, col_label = sector_3x3_labels(u, v, bbox, v_up=v_up)
             key = f"{row_label}_{col_label}"
 
             sector_values.setdefault(key, []).append(climate)
@@ -891,7 +1042,9 @@ def candidate_sector_climate_median_3x3(
     if bbox is None or uv is None:
         return None
 
-    row_label, col_label = sector_3x3_labels(uv[0], uv[1], bbox)
+    row_label, col_label = sector_3x3_labels(
+        uv[0], uv[1], bbox, v_up=v_axis_points_up(wall)
+    )
     key = f"{row_label}_{col_label}"
 
     sector_medians = wall.get("sector_climate_medians_3x3", {})
@@ -901,6 +1054,102 @@ def candidate_sector_climate_median_3x3(
 import statistics
 from typing import Dict, Any, Optional
 
+
+
+def _point_to_segment_dist(px, py, ax, ay, bx, by) -> float:
+    """
+    Shortest distance from point P to segment AB.
+    Uses perpendicular foot if it falls inside the segment,
+    otherwise falls back to nearest endpoint.
+    """
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+
+    if seg_len_sq < 1e-12:
+        # degenerate segment — return distance to endpoint
+        return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+
+    # parameter t of the foot along AB
+    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))   # clamp to [0, 1]
+
+    foot_x = ax + t * dx
+    foot_y = ay + t * dy
+
+    return math.sqrt((px - foot_x) ** 2 + (py - foot_y) ** 2)
+
+
+def point_to_top_edge_distance(
+    boundary_uv,
+    px: float,
+    py: float,
+    v_up: bool = True,
+) -> Optional[float]:
+    """
+    Perpendicular distance from (px, py) to the nearest wall boundary edge
+    that lies entirely above it.
+
+    These "top" edges are the roofline as seen from this point — for a
+    sloped/triangular wall this naturally picks up the diagonal gable edges,
+    not just a flat top edge. Works for rectangular, triangular, and any
+    polygon wall shape. Returns None if no boundary edge lies above the point.
+
+    v_up says which V direction is physically up on this wall (see
+    v_axis_points_up). On a wall whose V axis points down, "above" means
+    *smaller* V — get this wrong and the whole function measures to the ground
+    line instead of the roof.
+    """
+    if not boundary_uv or len(boundary_uv) < 3:
+        return None
+
+    loop = list(boundary_uv) + [boundary_uv[0]]
+    segments = [(loop[i], loop[i + 1]) for i in range(len(loop) - 1)]
+
+    if v_up:
+        top_edges = [(a, b) for a, b in segments if a[1] > py and b[1] > py]
+    else:
+        top_edges = [(a, b) for a, b in segments if a[1] < py and b[1] < py]
+
+    if not top_edges:
+        return None
+
+    return min(
+        _point_to_segment_dist(px, py, a[0], a[1], b[0], b[1])
+        for a, b in top_edges
+    )
+
+
+ROOF_STRICT_BAND_M = 1.5
+
+
+def is_distance_to_roof_strict(val) -> bool:
+    """
+    True if a species' distance_to_roof dataset value is "strict"
+    (case-insensitive, tolerant of stray/extra whitespace, e.g. " Strict ").
+    """
+    if val is None:
+        return False
+    s = re.sub(r"\s+", "", str(val)).strip().lower()
+    return s == "strict"
+
+
+def is_within_roof_strict_band(
+    boundary_uv,
+    px: float,
+    py: float,
+    max_dist_m: float = ROOF_STRICT_BAND_M,
+    v_up: bool = True,
+) -> bool:
+    """
+    True if (px, py) is within max_dist_m of the nearest roof edge (see
+    point_to_top_edge_distance) — the hard-constraint band for species whose
+    distance_to_roof is "strict".
+
+    Pass v_up from v_axis_points_up(wall); the default of True is only correct
+    for walls whose V axis genuinely points up.
+    """
+    d = point_to_top_edge_distance(boundary_uv, px, py, v_up=v_up)
+    return d is not None and d <= max_dist_m
 
 
 def candidate_roof_edge_distance_median(
@@ -929,57 +1178,19 @@ def candidate_roof_edge_distance_median(
     if len(buv) < 3:
         return None
 
-    # build closed loop of boundary segments
-    loop = buv + [buv[0]]
-    segments = [(loop[i], loop[i + 1]) for i in range(len(loop) - 1)]
-
     uvs = candidate.get("uv") or []
     if not uvs:
         return None
 
-    def point_to_segment_dist(px, py, ax, ay, bx, by) -> float:
-        """
-        Shortest distance from point P to segment AB.
-        Uses perpendicular foot if it falls inside the segment,
-        otherwise falls back to nearest endpoint.
-        """
-        dx, dy = bx - ax, by - ay
-        seg_len_sq = dx * dx + dy * dy
-
-        if seg_len_sq < 1e-12:
-            # degenerate segment — return distance to endpoint
-            return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
-
-        # parameter t of the foot along AB
-        t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
-        t = max(0.0, min(1.0, t))   # clamp to [0, 1]
-
-        foot_x = ax + t * dx
-        foot_y = ay + t * dy
-
-        return math.sqrt((px - foot_x) ** 2 + (py - foot_y) ** 2)
+    v_up = v_axis_points_up(wall)
 
     dists = []
     for uv in uvs:
         if not uv or len(uv) < 2:
             continue
-        px, py = float(uv[0]), float(uv[1])
-
-        # collect top edges: both endpoints strictly above nest V
-        top_edges = [
-            (a, b) for a, b in segments
-            if a[1] > py and b[1] > py
-        ]
-
-        if not top_edges:
-            continue
-
-        # shortest perpendicular distance across all top edges
-        d = min(
-            point_to_segment_dist(px, py, a[0], a[1], b[0], b[1])
-            for a, b in top_edges
-        )
-        dists.append(d)
+        d = point_to_top_edge_distance(buv, float(uv[0]), float(uv[1]), v_up=v_up)
+        if d is not None:
+            dists.append(d)
 
     if not dists:
         return None
@@ -1090,6 +1301,127 @@ def candidate_side_edge_distance_median(
         "side_edge_label": dominant_side,
     }
 
+def _window_side_distance_at_point(windows: dict, px: float, py: float) -> Optional[float]:
+    """
+    Horizontal (side-only) distance from (px, py) to the nearest window whose
+    vertical (V) extent contains py — a window directly above or below the
+    point is ignored entirely; only windows level with it ("to the side")
+    count. Returns None if no window's V-range contains py.
+    """
+    best = None
+    for win in (windows or {}).values():
+        huv = win.get("hull_uv")
+        if not huv or len(huv) < 3:
+            continue
+
+        us = [p[0] for p in huv]
+        vs = [p[1] for p in huv]
+        v_min, v_max = min(vs), max(vs)
+
+        if py < v_min or py > v_max:
+            continue
+
+        u_min, u_max = min(us), max(us)
+
+        if u_min <= px <= u_max:
+            d = 0.0
+        elif px < u_min:
+            d = u_min - px
+        else:
+            d = px - u_max
+
+        if best is None or d < best:
+            best = d
+
+    return best
+
+
+def candidate_window_side_distance(
+    building_dict: dict,
+    candidate: Dict[str, Any],
+) -> Optional[float]:
+    """
+    Distance from the candidate's closest nest point to the nearest window,
+    measured only horizontally (side-to-side) — windows directly above or
+    below a nest point don't count, only ones level with it do.
+
+    For a colony this is "the distance from the closest nest placement to
+    the closest window nearby"; for a solitary placement (one point) it's
+    just that point's distance to the nearest window to its side.
+    Returns None if the wall has no windows, or none share a nest point's
+    height band.
+    """
+    wall_id = candidate["wall_id"]
+    wall    = building_dict.get(wall_id)
+    if wall is None:
+        return None
+
+    windows = wall.get("windows") or {}
+    if not windows:
+        return None
+
+    uvs = candidate.get("uv") or []
+    if not uvs:
+        return None
+
+    dists = []
+    for uv in uvs:
+        if not uv or len(uv) < 2:
+            continue
+        d = _window_side_distance_at_point(windows, float(uv[0]), float(uv[1]))
+        if d is not None:
+            dists.append(d)
+
+    if not dists:
+        return None
+
+    return float(min(dists))
+
+
+def candidate_window_side_distance_median(
+    building_dict: dict,
+    candidate: Dict[str, Any],
+) -> Optional[float]:
+    """
+    Median, across all of the candidate's nest points, of each nest's
+    distance to its nearest same-height-band window — same per-point rule as
+    candidate_window_side_distance (side-only; windows above/below a nest
+    don't count), but median instead of minimum.
+
+    Where candidate_window_side_distance answers "how close is the closest
+    nest to a window," this answers "how close are the nests to windows
+    typically" — robust to a single outlier nest, useful when a colony has
+    several nests and only one happens to sit right next to a window.
+    Returns None if the wall has no windows, or none share any nest point's
+    height band.
+    """
+    wall_id = candidate["wall_id"]
+    wall    = building_dict.get(wall_id)
+    if wall is None:
+        return None
+
+    windows = wall.get("windows") or {}
+    if not windows:
+        return None
+
+    uvs = candidate.get("uv") or []
+    if not uvs:
+        return None
+
+    dists = []
+    for uv in uvs:
+        if not uv or len(uv) < 2:
+            continue
+        d = _window_side_distance_at_point(windows, float(uv[0]), float(uv[1]))
+        if d is not None:
+            dists.append(d)
+
+    if not dists:
+        return None
+
+    return float(statistics.median(dists))
+
+
 def candidate_edge_features(
     building_dict: dict,
     candidate: Dict[str, Any],
@@ -1100,11 +1432,15 @@ def candidate_edge_features(
 
     top_dist = candidate_roof_edge_distance_median(building_dict, candidate)
     side_feats = candidate_side_edge_distance_median(building_dict, candidate)
+    window_dist = candidate_window_side_distance(building_dict, candidate)
+    window_dist_median = candidate_window_side_distance_median(building_dict, candidate)
 
     return {
         "dist_to_top_edge_median": top_dist,
         "dist_to_side_edge_median": side_feats["side_edge_distance_median"],
         "side_edge_label": side_feats["side_edge_label"],
+        "distance_to_window": window_dist,
+        "distance_to_window_median": window_dist_median,
     }
 
 def orientation_from_xy_vector(x: float, y: float) -> tuple[Optional[str], Optional[float]]:
@@ -1178,8 +1514,13 @@ def candidate_local_height_stats(
     candidate: dict,
 ) -> Dict[str, float]:
     """
-    Returns candidate height statistics relative to
-    the wall lowest Z value.
+    Returns candidate height statistics relative to the wall lowest Z value.
+
+    height_std_m is the standard deviation of the candidate's nest Z
+    positions — low values mean the colony's nests sit at roughly the same
+    height (a horizontal cluster), high values mean they're spread out
+    vertically (stacked in a line). 0.0 for a single-point (solitary)
+    candidate.
     """
 
     wall_id = candidate["wall_id"]
@@ -1192,6 +1533,7 @@ def candidate_local_height_stats(
             "mean_height_m": np.nan,
             "min_height_m": np.nan,
             "max_height_m": np.nan,
+            "height_std_m": np.nan,
         }
 
     # wall local zero
@@ -1209,6 +1551,7 @@ def candidate_local_height_stats(
             "mean_height_m": np.nan,
             "min_height_m": np.nan,
             "max_height_m": np.nan,
+            "height_std_m": np.nan,
         }
 
     wall_ground_z = float(np.min(wall_zs))
@@ -1222,4 +1565,5 @@ def candidate_local_height_stats(
         "mean_height_m": float(np.mean(zs_local)),
         "min_height_m": float(np.min(zs_local)),
         "max_height_m": float(np.max(zs_local)),
+        "height_std_m": float(np.std(zs_local)),
     }

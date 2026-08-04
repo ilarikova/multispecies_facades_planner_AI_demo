@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from shapely.geometry import Point
 
 from multispecies_facades_planner_AI import facade_planner_functions as fpf
+from multispecies_facades_planner_AI import facade_planner_species as fps
 from multispecies_facades_planner_AI import data_extraction as de
 
 # ─────────────────────────────────────────────────────────────────
@@ -20,21 +21,43 @@ excel_path = r"C:\Users\ILarikova\workspace\multispecies_facades_planner_AI\data
 
 
 ALL_ORIENTATIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+# Upper bound on nest height at planning time.
+#
+# The training generator (facade_planner.base_candidates_for_wall) gates on
+# min_height_m ONLY — it never dropped points above the species' stated maximum,
+# so the exported candidates and the expert labels both span the full wall.
+# Enforcing the cap here made the planner stricter than the data it learned from:
+# for black_redstart (nest_height "2-6") it removed 53% of the training rows and
+# 55% of the expert's own BEST picks; for common_pipistrelle ("...-9") it removed
+# 67% of them. The expert's best-pick rate was effectively flat across the cap
+# (5.2% below vs 5.6% above), i.e. they did not treat higher placements as worse.
+#
+# Set to False (2026-08-04) so inference matches the generator exactly. Flip it
+# back to True to reinstate the cap — nothing else needs to change.
+ENFORCE_MAX_HEIGHT = False
  
+# MUST stay identical to data_training_model1.ALL_FEATURES — a feature listed
+# there but not built here silently arrives as NaN at inference.
 ALL_FEATURES = [
-    "wall_free_area_m2", "door_count", "wall_shape",
+    "wall_free_area_m2", "wall_height_m", "door_count", "wall_shape",
     "orientation", "floor_function", "neighbor_umin", "neighbor_umax",
     "building_function", "wall_climate_median",
     "section_row", "section_col",
-    "mean_height_m", "min_height_m", "max_height_m",
+    "mean_height_m", "min_height_m", "max_height_m", "height_std_m",
+    "colony_nests_placed",
     "dist_to_top_edge_median", "dist_to_side_edge_median",
     "side_edge_label", "orientation_match", "sector_climate_median",
+    "distance_to_window", "distance_to_window_median",
     "colonial", "colony_size_local_min", "colony_size_local_max",
+    "nest_distance_min_m", "nest_distance_max_m",
     "noise_level", "human_tolerance_level", "dirt", "taxa",
-    "is_day_active", "is_evening_active", "is_dusk_active",
+    "is_bird", "is_bat",
+    "is_day_active", "is_evening_active", "is_dusk_active", "is_night_active",
     "nest_use_start_month", "nest_use_end_month", "nest_use_duration",
     "preferred_height_min_m", "preferred_height_max_m",
     "prefers_edges_proximity", "prefers_roof_proximity",
+    "far_from_windows_important",
     "nest_temp_min_c", "nest_temp_max_c",
 ]
  
@@ -45,6 +68,132 @@ CATEGORICAL_COLS = [
 ]
  
  
+# ─────────────────────────────────────────────────────────────────
+# SHARED FEATURE BUILDERS — must mirror the training generator exactly
+# ─────────────────────────────────────────────────────────────────
+
+_TRAITS_CACHE: Dict[int, Tuple[dict, dict]] = {}
+
+
+def _species_fields(needs: dict) -> dict:
+    # All species-trait features, encoded exactly as the training generator
+    # encodes them (fps.encode_species_traits, verified against export3107).
+    #
+    # `needs` is the RAW species-table row: its keys are sheet column names
+    # ("species_noise", "time_activity", "temperature_optimum_in_nest_box"),
+    # not feature names. This module used to read needs.get("noise_level"),
+    # needs.get("is_day_active"), needs.get("nest_temp_min_c") and so on
+    # directly — every one of those returned None, leaving 17 of the model's
+    # features dead at inference while training saw real values.
+    #
+    # Cached per `needs` object: the row builders are called once per candidate
+    # point, and the encoding is pure string/regex parsing of the same dict.
+    # The cache holds a reference to `needs` alongside its traits, so the dict
+    # cannot be collected and have its id reused by another species' dict —
+    # which would otherwise serve one species the traits of another.
+    key = id(needs)
+    cached = _TRAITS_CACHE.get(key)
+    if cached is not None and cached[0] is needs:
+        return cached[1]
+
+    traits = fps.encode_species_traits(needs)
+    _TRAITS_CACHE[key] = (needs, traits)
+    return traits
+
+
+def _orientation_fields(wall: dict, needs: dict) -> dict:
+    # Wall orientation and its match against the species preference.
+    #
+    # needs[...] holds the RAW species-table text ("north, east"). The training
+    # CSV stores the normalised set ("E,N") and derives orientation_match with
+    # fps.orientation_match. Splitting the raw text on commas instead — as this
+    # module did before — gives ["NORTH", "EAST"], which can never equal a
+    # compass label, so orientation_match was pinned to 0 on exactly the walls
+    # the species prefers, and all 16 orientation one-hot flags built by
+    # _engineer_features were pinned to 0.
+    ori = (wall.get("orientation") or "").strip().upper() or None
+
+    return {
+        "orientation":       ori,
+        "orientation_match": fps.orientation_match(ori, needs.get("preferred_orientation")),
+    }
+
+
+def _wall_context_fields(wall: dict) -> dict:
+    # Wall-level features. wall_free_area_m2 / building_function /
+    # neighbor_umin / neighbor_umax are stamped onto each wall by plan();
+    # door_count and wall_height_m are not stored on the wall at all, so they
+    # are derived the same way the generator derives them.
+    return {
+        "wall_free_area_m2":   wall.get("wall_free_area_m2"),
+        "wall_height_m":       fpf.wall_height_m(wall),
+        "wall_shape":          wall.get("wall_shape"),
+        "door_count":          len(wall.get("doors") or {}),
+        "floor_function":      wall.get("floor_function"),
+        "neighbor_umin":       wall.get("neighbor_umin"),
+        "neighbor_umax":       wall.get("neighbor_umax"),
+        "building_function":   wall.get("building_function"),
+        "wall_climate_median": wall.get("wall_climate_median"),
+    }
+
+
+def _candidate_fields(wall_id: str, wall: dict, uvs: list, xyzs: list,
+                      needs: dict | None = None) -> dict:
+    # Edge and sector-climate features via the same fpf helpers the training
+    # generator uses, so inference and training agree on their definitions.
+    #
+    # Those helpers only ever look up building_dict[wall_id], so a one-wall dict
+    # is enough. They are also v_up-aware (see
+    # docs/roof_band_axis_bug_and_repair.md). What stood here before was not:
+    # dist_to_top_edge_median was approximated as "wall's highest grid Z minus
+    # this point's Z" instead of the perpendicular distance to the roofline, and
+    # dist_to_side_edge_median / side_edge_label / sector_climate_median were
+    # read from wall-level keys that do not exist, so they were always None.
+    EMPTY = {
+        "dist_to_top_edge_median":   None,
+        "dist_to_side_edge_median":  None,
+        "side_edge_label":           None,
+        "distance_to_window":        None,
+        "distance_to_window_median": None,
+        "sector_climate_median":     None,
+        "mean_height_m":             None,
+        "min_height_m":              None,
+        "max_height_m":              None,
+        "height_std_m":              None,
+        "colony_nests_placed":       np.nan,
+    }
+    if not uvs or not xyzs:
+        return dict(EMPTY)
+
+    bd = {wall_id: wall}
+    candidate = {
+        "wall_id": wall_id,
+        "uv":  [[float(p[0]), float(p[1])] for p in uvs],
+        "xyz": [list(p) for p in xyzs],
+    }
+    ef = fpf.candidate_edge_features(bd, candidate)
+    hs = fpf.candidate_local_height_stats(bd, candidate)
+
+    # Colony size is NaN for solitary species in training, so mirror that
+    # rather than writing 1 — the model saw NaN for every solitary row.
+    colonial = _species_fields(needs).get("colonial") if needs is not None else None
+    colony_nests_placed = len(candidate["xyz"]) if colonial == 1 else np.nan
+
+    return {
+        "dist_to_top_edge_median":   ef["dist_to_top_edge_median"],
+        "dist_to_side_edge_median":  ef["dist_to_side_edge_median"],
+        "side_edge_label":           ef["side_edge_label"],
+        "distance_to_window":        ef["distance_to_window"],
+        "distance_to_window_median": ef["distance_to_window_median"],
+        "sector_climate_median":     fpf.candidate_sector_climate_median_3x3(bd, candidate),
+        "mean_height_m":             hs["mean_height_m"],
+        "min_height_m":              hs["min_height_m"],
+        "max_height_m":              hs["max_height_m"],
+        "height_std_m":              hs["height_std_m"],
+        "colony_nests_placed":       colony_nests_placed,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────
 # STEP 1 — HARD CONSTRAINT WALL FILTER
 # ─────────────────────────────────────────────────────────────────
@@ -83,57 +232,18 @@ def _is_wall_hard_excluded(wall_id: str, wall: dict) -> bool:
 def _build_wall_feature_row(wall_id: str, wall: dict, needs: dict) -> dict:
     # Builds a single feature row representing this wall (no placement yet).
     # Uses wall-level fields only; sector and candidate fields left as NaN.
-    ori = (wall.get("orientation") or "").strip().upper()
-    preferred_raw = (needs.get("preferred_orientation") or "")
-    preferred = [o.strip().upper() for o in str(preferred_raw).split(",") if o.strip()]
-    orientation_match = 1 if (ori and ori in preferred) else 0
- 
     row = {
         "wall_id": wall_id,
-        "wall_free_area_m2":    wall.get("wall_free_area_m2"),
-        "door_count":           wall.get("door_count"),
-        "wall_shape":           wall.get("wall_shape"),
-        "orientation":          ori or None,
-        "floor_function":       wall.get("floor_function"),
-        "neighbor_umin":        wall.get("neighbor_umin"),
-        "neighbor_umax":        wall.get("neighbor_umax"),
-        "building_function":    wall.get("building_function"),
-        "wall_climate_median":  wall.get("wall_climate_median"),
-        "orientation_match":    orientation_match,
+        **_wall_context_fields(wall),
+        **_orientation_fields(wall, needs),
+        **_candidate_fields(wall_id, wall, [], [], needs),
         "section_row":          None,
         "section_col":          None,
-        "mean_height_m":        None,
-        "min_height_m":         None,
-        "max_height_m":         None,
-        "dist_to_top_edge_median":  None,
-        "dist_to_side_edge_median": None,
-        "side_edge_label":      None,
-        "sector_climate_median": None,
-        "colonial":                 needs.get("colonial"),
-        "colony_size_local_min":    needs.get("colony_size_local_min"),
-        "colony_size_local_max":    needs.get("colony_size_local_max"),
-        "noise_level":              needs.get("noise_level"),
-        "human_tolerance_level":    needs.get("human_tolerance_level"),
-        "dirt":                     needs.get("dirt"),
-        "taxa":                     needs.get("taxa"),
-        "is_day_active":            needs.get("is_day_active"),
-        "is_evening_active":        needs.get("is_evening_active"),
-        "is_dusk_active":           needs.get("is_dusk_active"),
-        "nest_use_start_month":     needs.get("nest_use_start_month"),
-        "nest_use_end_month":       needs.get("nest_use_end_month"),
-        "nest_use_duration":        needs.get("nest_use_duration"),
-        "preferred_height_min_m":   needs.get("preferred_height_min_m"),
-        "preferred_height_max_m":   needs.get("preferred_height_max_m"),
-        "prefers_edges_proximity":  needs.get("prefers_edges_proximity"),
-        "prefers_roof_proximity":   needs.get("prefers_roof_proximity"),
-        "nest_temp_min_c":          needs.get("nest_temp_min_c"),
-        "nest_temp_max_c":          needs.get("nest_temp_max_c"),
-        "preferred_orientation":    preferred_raw,
-        "avoided_orientation":      needs.get("avoided_orientation"),
+        **_species_fields(needs),
     }
     return row
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────
 # STEP 3 — SECTOR FEASIBILITY CHECK
 # ─────────────────────────────────────────────────────────────────
@@ -146,46 +256,84 @@ def _get_sector_feasible_points(
     min_height_m: float,
     max_height_m: float,
     usable_geom,
-    building_zero_z: float,
+    needs: dict | None = None,
 ) -> list:
-    # Returns grid points in this sector that pass height and usable area constraints.
-    # sector_row/col are computed from UV via fpf.sector_3x3_labels — NOT read from
-    # stored grid fields (they are not stored there).
-    # Height is measured from building_zero_z (lowest Z across all building walls).
+    # Returns grid points in this sector that pass the same hard constraints the
+    # training generator applied in facade_planner.base_candidates_for_wall:
+    #
+    #   1. inside the usable area (openings minus the window/door offset band)
+    #   2. rel_h >= min_height_m, measured from THIS WALL's lowest grid Z
+    #   3. if needs["distance_to_roof"] == "strict", within fpf.ROOF_STRICT_BAND_M
+    #      (1.5 m) of the nearest roof edge — v_up-aware, so it follows sloped and
+    #      gable roof lines rather than the bottom of a flipped wall
+    #
+    # Swift and house martin are the "strict" species: swift is `> 6` m and
+    # strict, house martin `> 2` m and strict. black_redstart and house_sparrow
+    # are "close", so the 1.5 m band does not apply to them.
+    #
+    # Height reference: the generator measures rel_h from the wall's own lowest
+    # grid Z, and candidate_local_height_stats (which produces mean/min/max_height_m)
+    # does the same. This used to take building_zero_z — the lowest Z across the
+    # WHOLE building — which admitted points the generator would never have
+    # emitted as candidates on any wall whose base sits above the building low
+    # point (e.g. 5128-wall-00, where it let 24 swift points through against the
+    # generator's 0).
+    #
+    # sector_row/col are computed from UV via fpf.sector_3x3_labels — NOT read
+    # from stored grid fields (they are not stored there).
     wall = building_dict[wall_id]
     grid = wall.get("grid") or {}
     bbox = fpf.wall_uv_bbox_from_building(building_dict, wall_id)
     if bbox is None:
         return []
- 
+
+    roof_strict = fpf.is_distance_to_roof_strict((needs or {}).get("distance_to_roof"))
+    boundary_uv = wall.get("boundary_uv") or []
+    v_up = fpf.v_axis_points_up(wall)
+
+    zs_all = [
+        float(pdata["point_on_wall"][2])
+        for pdata in grid.values()
+        if pdata.get("point_on_wall")
+        and isinstance(pdata["point_on_wall"][2], (int, float))
+    ]
+    if not zs_all:
+        return []
+    wall_ground_z = min(zs_all)
+
     pts = []
- 
+
     for pid, pdata in grid.items():
         uv  = pdata.get("uv")
         xyz = pdata.get("point_on_wall")
         if not uv or not xyz:
             continue
- 
+
         row_label, col_label = fpf.sector_3x3_labels(
-            float(uv[0]), float(uv[1]), bbox
+            float(uv[0]), float(uv[1]), bbox, v_up=v_up
         )
         if row_label != sector_row or col_label != sector_col:
             continue
- 
+
         z = float(xyz[2])
-        rel_h = z - building_zero_z
- 
+        rel_h = z - wall_ground_z
+
         if rel_h < min_height_m:
             continue
-        if max_height_m > 0 and rel_h > max_height_m:
+        if ENFORCE_MAX_HEIGHT and max_height_m > 0 and rel_h > max_height_m:
             continue
- 
+
         p = Point(float(uv[0]), float(uv[1]))
         if not usable_geom.contains(p):
             continue
- 
+
+        if roof_strict and not fpf.is_within_roof_strict_band(
+            boundary_uv, float(uv[0]), float(uv[1]), v_up=v_up
+        ):
+            continue
+
         pts.append((pid, [float(uv[0]), float(uv[1])], [float(xyz[0]), float(xyz[1]), z]))
- 
+
     return pts
  
  
@@ -220,13 +368,15 @@ def _get_all_sectors(building_dict: dict, wall_id: str) -> list:
     if bbox is None:
         return []
  
+    v_up = fpf.v_axis_points_up(wall)
+
     seen = set()
     for pdata in grid.values():
         uv = pdata.get("uv")
         if not uv or len(uv) < 2:
             continue
         row_label, col_label = fpf.sector_3x3_labels(
-            float(uv[0]), float(uv[1]), bbox
+            float(uv[0]), float(uv[1]), bbox, v_up=v_up
         )
         seen.add((row_label, col_label))
     return list(seen)
@@ -245,85 +395,25 @@ def _build_sector_feature_row(
     needs: dict,
 ) -> dict:
     # Builds a feature row for one sector using the feasible points in that sector.
-    heights = [pt[2][2] for pt in feasible_pts]
- 
-    grid = wall.get("grid") or {}
-    zs_all = [
-        float(pdata["point_on_wall"][2])
-        for pdata in grid.values()
-        if pdata.get("point_on_wall")
-    ]
-    wall_ground_z = min(zs_all) if zs_all else 0.0
- 
-    rel_heights = [z - wall_ground_z for z in heights]
-    mean_h = float(np.mean(rel_heights)) if rel_heights else None
-    min_h  = float(np.min(rel_heights))  if rel_heights else None
-    max_h  = float(np.max(rel_heights))  if rel_heights else None
- 
-    sec_climate_vals = []
-    for pid, uv, xyz in feasible_pts:
-        pdata = grid.get(pid) or {}
-        cv = pdata.get("climate_value") or pdata.get("solar_radiation")
-        if cv is not None:
-            try:
-                sec_climate_vals.append(float(cv))
-            except (ValueError, TypeError):
-                pass
-    sector_climate = float(np.median(sec_climate_vals)) if sec_climate_vals else None
- 
-    ori = (wall.get("orientation") or "").strip().upper()
-    preferred_raw = (needs.get("preferred_orientation") or "")
-    preferred = [o.strip().upper() for o in str(preferred_raw).split(",") if o.strip()]
-    orientation_match = 1 if (ori and ori in preferred) else 0
- 
     row = {
         "wall_id":    wall_id,
         "sector_row": sector_row,
         "sector_col": sector_col,
-        "wall_free_area_m2":    wall.get("wall_free_area_m2"),
-        "door_count":           wall.get("door_count"),
-        "wall_shape":           wall.get("wall_shape"),
-        "orientation":          ori or None,
-        "floor_function":       wall.get("floor_function"),
-        "neighbor_umin":        wall.get("neighbor_umin"),
-        "neighbor_umax":        wall.get("neighbor_umax"),
-        "building_function":    wall.get("building_function"),
-        "wall_climate_median":  wall.get("wall_climate_median"),
-        "orientation_match":    orientation_match,
+        **_wall_context_fields(wall),
+        **_orientation_fields(wall, needs),
+        **_candidate_fields(
+            wall_id, wall,
+            [pt[1] for pt in feasible_pts],
+            [pt[2] for pt in feasible_pts],
+            needs,
+        ),
         "section_row":          sector_row,
         "section_col":          sector_col,
-        "mean_height_m":        mean_h,
-        "min_height_m":         min_h,
-        "max_height_m":         max_h,
-        "dist_to_top_edge_median":  wall.get("dist_to_top_edge_median"),
-        "dist_to_side_edge_median": wall.get("dist_to_side_edge_median"),
-        "side_edge_label":          wall.get("side_edge_label"),
-        "sector_climate_median":    sector_climate,
-        "colonial":                 needs.get("colonial"),
-        "colony_size_local_min":    needs.get("colony_size_local_min"),
-        "colony_size_local_max":    needs.get("colony_size_local_max"),
-        "noise_level":              needs.get("noise_level"),
-        "human_tolerance_level":    needs.get("human_tolerance_level"),
-        "dirt":                     needs.get("dirt"),
-        "taxa":                     needs.get("taxa"),
-        "is_day_active":            needs.get("is_day_active"),
-        "is_evening_active":        needs.get("is_evening_active"),
-        "is_dusk_active":           needs.get("is_dusk_active"),
-        "nest_use_start_month":     needs.get("nest_use_start_month"),
-        "nest_use_end_month":       needs.get("nest_use_end_month"),
-        "nest_use_duration":        needs.get("nest_use_duration"),
-        "preferred_height_min_m":   needs.get("preferred_height_min_m"),
-        "preferred_height_max_m":   needs.get("preferred_height_max_m"),
-        "prefers_edges_proximity":  needs.get("prefers_edges_proximity"),
-        "prefers_roof_proximity":   needs.get("prefers_roof_proximity"),
-        "nest_temp_min_c":          needs.get("nest_temp_min_c"),
-        "nest_temp_max_c":          needs.get("nest_temp_max_c"),
-        "preferred_orientation":    preferred_raw,
-        "avoided_orientation":      needs.get("avoided_orientation"),
+        **_species_fields(needs),
     }
     return row
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────
 # STEP 4 — PLACEMENT WITHIN SECTOR (AI-guided, hard constraints enforced)
 # ─────────────────────────────────────────────────────────────────
@@ -340,69 +430,22 @@ def _build_point_feature_row(
     needs: dict,
 ) -> dict:
     # Builds a feature row for one individual grid point (placement candidate).
-    rel_h = float(xyz[2]) - wall_ground_z
- 
-    ori = (wall.get("orientation") or "").strip().upper()
-    preferred_raw = (needs.get("preferred_orientation") or "")
-    preferred = [o.strip().upper() for o in str(preferred_raw).split(",") if o.strip()]
-    orientation_match = 1 if (ori and ori in preferred) else 0
- 
-    grid = wall.get("grid") or {}
-    zs_all = [
-        float(pdata["point_on_wall"][2])
-        for pdata in grid.values()
-        if pdata.get("point_on_wall")
-    ]
-    max_z = max(zs_all) if zs_all else float(xyz[2])
-    dist_to_top = (max_z - float(xyz[2]))
- 
+    # wall_ground_z is kept in the signature for call-site compatibility; the
+    # height stats now come from fpf.candidate_local_height_stats, which uses
+    # the wall's own lowest grid Z — the same reference the generator used.
     row = {
         "point_id":   pid,
         "wall_id":    wall_id,
-        "wall_free_area_m2":    wall.get("wall_free_area_m2"),
-        "door_count":           wall.get("door_count"),
-        "wall_shape":           wall.get("wall_shape"),
-        "orientation":          ori or None,
-        "floor_function":       wall.get("floor_function"),
-        "neighbor_umin":        wall.get("neighbor_umin"),
-        "neighbor_umax":        wall.get("neighbor_umax"),
-        "building_function":    wall.get("building_function"),
-        "wall_climate_median":  wall.get("wall_climate_median"),
-        "orientation_match":    orientation_match,
+        **_wall_context_fields(wall),
+        **_orientation_fields(wall, needs),
+        **_candidate_fields(wall_id, wall, [uv], [xyz], needs),
         "section_row":          sector_row,
         "section_col":          sector_col,
-        "mean_height_m":        rel_h,
-        "min_height_m":         rel_h,
-        "max_height_m":         rel_h,
-        "dist_to_top_edge_median":  dist_to_top,
-        "dist_to_side_edge_median": wall.get("dist_to_side_edge_median"),
-        "side_edge_label":          wall.get("side_edge_label"),
-        "sector_climate_median":    wall.get("wall_climate_median"),
-        "colonial":                 needs.get("colonial"),
-        "colony_size_local_min":    needs.get("colony_size_local_min"),
-        "colony_size_local_max":    needs.get("colony_size_local_max"),
-        "noise_level":              needs.get("noise_level"),
-        "human_tolerance_level":    needs.get("human_tolerance_level"),
-        "dirt":                     needs.get("dirt"),
-        "taxa":                     needs.get("taxa"),
-        "is_day_active":            needs.get("is_day_active"),
-        "is_evening_active":        needs.get("is_evening_active"),
-        "is_dusk_active":           needs.get("is_dusk_active"),
-        "nest_use_start_month":     needs.get("nest_use_start_month"),
-        "nest_use_end_month":       needs.get("nest_use_end_month"),
-        "nest_use_duration":        needs.get("nest_use_duration"),
-        "preferred_height_min_m":   needs.get("preferred_height_min_m"),
-        "preferred_height_max_m":   needs.get("preferred_height_max_m"),
-        "prefers_edges_proximity":  needs.get("prefers_edges_proximity"),
-        "prefers_roof_proximity":   needs.get("prefers_roof_proximity"),
-        "nest_temp_min_c":          needs.get("nest_temp_min_c"),
-        "nest_temp_max_c":          needs.get("nest_temp_max_c"),
-        "preferred_orientation":    preferred_raw,
-        "avoided_orientation":      needs.get("avoided_orientation"),
+        **_species_fields(needs),
     }
     return row
- 
- 
+
+
 def _pick_points_cluster(
     candidates: list,
     target_size: int,
@@ -619,18 +662,24 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df.drop(columns=[col], inplace=True)
  
     numeric_cols = [
-        "wall_free_area_m2", "wall_climate_median", "sector_climate_median",
-        "mean_height_m", "min_height_m", "max_height_m",
+        "wall_free_area_m2", "wall_height_m",
+        "wall_climate_median", "sector_climate_median",
+        "mean_height_m", "min_height_m", "max_height_m", "height_std_m",
+        "colony_nests_placed",
         "dist_to_top_edge_median", "dist_to_side_edge_median",
+        "distance_to_window", "distance_to_window_median",
         "nest_temp_min_c", "nest_temp_max_c",
         "preferred_height_min_m", "preferred_height_max_m",
         "colony_size_local_min", "colony_size_local_max",
+        "nest_distance_min_m", "nest_distance_max_m",
         "orientation_match",
         "door_count", "colonial",
         "noise_level", "human_tolerance_level", "dirt",
-        "is_day_active", "is_evening_active", "is_dusk_active",
+        "is_bird", "is_bat",
+        "is_day_active", "is_evening_active", "is_dusk_active", "is_night_active",
         "nest_use_start_month", "nest_use_end_month", "nest_use_duration",
         "prefers_edges_proximity", "prefers_roof_proximity",
+        "far_from_windows_important",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -924,7 +973,7 @@ def _place_solitary_boxes(
                 min_height_m=height_min,
                 max_height_m=height_max,
                 usable_geom=usable_geom,
-                building_zero_z=building_zero_z,
+                needs=needs,
             )
             # filter to only points in valid distance range from any placed box
             valid_pts = []
@@ -1052,7 +1101,7 @@ def _try_place_on_wall(
             min_height_m=height_min,
             max_height_m=height_max,
             usable_geom=usable_geom,
-            building_zero_z=building_zero_z,
+            needs=needs,
         )
         if len(pts) >= colony_min:
             feasible_sectors.append((sec_row, sec_col, pts))
@@ -1266,8 +1315,9 @@ def plan(
             if _xyz and isinstance(_xyz[2], (int, float)):
                 all_zs.append(float(_xyz[2]))
     building_zero_z = float(min(all_zs)) if all_zs else 0.0
+    _cap = f"{height_max}" if (ENFORCE_MAX_HEIGHT and height_max > 0) else "no upper bound"
     print(f"  Building zero Z: {building_zero_z:.3f}  "
-          f"height range: {height_min}–{height_max} m above building zero")
+          f"min height: {height_min} m above each wall's own base, cap: {_cap}")
  
     # STEP 1: filter walls by hard constraints
     eligible_walls = []
@@ -1298,10 +1348,17 @@ def plan(
     target_walls = _resolve_target_walls(num_ori_str, len(eligible_walls))
     print(f"  Orientation mode: {num_ori_str}  target walls: {target_walls}")
  
-    # collect the top target_walls ranked walls that can actually produce a placement
+    # A solitary species whose orientation mode resolves to a single wall used to
+    # get both options on that one wall, differing only by sector — so Option 2
+    # was never a real alternative facade. Look one wall deeper so Option 2 can
+    # be offered on the SECOND-best wall instead.
+    solitary = _species_fields(needs).get("colonial") == 0
+    walls_wanted = target_walls + 1 if (solitary and target_walls == 1) else target_walls
+
+    # collect the top ranked walls that can actually produce a placement
     viable_walls: List[str] = []
     for wid in ranked_wall_ids:
-        if len(viable_walls) >= target_walls:
+        if len(viable_walls) >= walls_wanted:
             break
         # quick feasibility check — does this wall have any feasible sectors?
         wall = building_dict[wid]
@@ -1314,7 +1371,7 @@ def plan(
                 building_dict=building_dict, wall_id=wid,
                 sector_row=sr, sector_col=sc,
                 min_height_m=height_min, max_height_m=height_max,
-                usable_geom=usable_geom, building_zero_z=building_zero_z,
+                usable_geom=usable_geom, needs=needs,
             )) >= colony_min
             for sr, sc in all_sectors
         )
@@ -1324,16 +1381,28 @@ def plan(
     if not viable_walls:
         raise ValueError("Planning failed: no viable walls found.")
  
-    # STEP 3 + 4: build two options
-    # Option 1 — sector_rank 0 (best sector) on each viable wall
-    # Option 2 — sector_rank 1 (second best sector, with fallback) on each viable wall
+    # STEP 3 + 4: build two options, as (walls, sector_rank) pairs.
+    #
+    #   solitary + single target wall -> Option 1 = best wall, Option 2 = second
+    #                                    best wall, each in its own best sector
+    #   otherwise                     -> both options span the same target walls,
+    #                                    Option 1 = best sector, Option 2 = second
+    #                                    best sector (with fallback)
+    if solitary and target_walls == 1 and len(viable_walls) >= 2:
+        option_specs = [([viable_walls[0]], 0), ([viable_walls[1]], 0)]
+        rerank_by_score = False          # wall ranking already fixes the order
+    else:
+        walls = viable_walls[:target_walls]
+        option_specs = [(walls, 0), (walls, 1)]
+        rerank_by_score = target_walls == 1
+
     raw_options = []
     # tracks Option 1 point ids per wall so Option 2 can avoid duplicates
     opt1_ids_by_wall: Dict[str, set] = {}
- 
-    for sector_rank in [0, 1]:
+
+    for option_no, (option_walls, sector_rank) in enumerate(option_specs, start=1):
         placements = []
-        for wid in viable_walls:
+        for wid in option_walls:
             result = _try_place_on_wall(
                 building_dict=building_dict,
                 wall_id=wid,
@@ -1362,14 +1431,14 @@ def plan(
                     result["colony_size"]        = len(all_boxes)
                 placements.append(result)
                 # store Option 1 point ids for duplicate detection in Option 2
-                if sector_rank == 0:
+                if option_no == 1:
                     opt1_ids_by_wall[wid] = set(result.get("selected_point_ids") or [])
-                print(f"  Option {sector_rank+1} wall={wid} "
+                print(f"  Option {option_no} wall={wid} "
                       f"sector=({result['section_row']},{result['section_col']}) "
                       f"colony_size={result['colony_size']} "
                       f"placement_score={result['placement_score']}")
             else:
-                print(f"  Option {sector_rank+1} wall={wid}: placement failed — skipped.")
+                print(f"  Option {option_no} wall={wid}: placement failed — skipped.")
  
         if placements:
             best_idx = int(np.argmax([p["placement_score"] for p in placements]))
@@ -1381,8 +1450,10 @@ def plan(
     if not raw_options:
         raise ValueError("Planning failed: no valid placement found on any wall.")
  
-    # for single-orientation species re-rank so higher placement_score = Option 1
-    if target_walls == 1 and len(raw_options) == 2:
+    # Same-wall options only: re-rank so the higher placement_score becomes
+    # Option 1. Skipped when the two options are different walls — there the
+    # wall ranking already decides which is second best.
+    if rerank_by_score and len(raw_options) == 2:
         score_opt1 = raw_options[0]["placements"][0]["placement_score"]
         score_opt2 = raw_options[1]["placements"][0]["placement_score"]
         if score_opt2 > score_opt1:

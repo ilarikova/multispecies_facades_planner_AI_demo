@@ -31,22 +31,28 @@ OPENING_FIT_TOLERANCE_M = 0.8
 BUILDINGS = [
     {"file": "building4868.json", "street": "Preysingstraße", "house_number": "3", "zip_code": "85049"},
     {"file": "building5038.json", "street": "Münzbergstraße", "house_number": "16", "zip_code": "85049"},
-    {"file": "building0173.json", "street": "Schäffbräustraße", "house_number": "23", "zip_code": "85049"},
+    # No street address on record for these two — labelled by building id until
+    # someone fills them in. They are the other two buildings the models were
+    # trained on (export3107).
+    {"file": "building4115.json", "street": "Building 4115", "house_number": "", "zip_code": "85049"},
+    {"file": "building5128.json", "street": "Building 5128", "house_number": "", "zip_code": "85049"},
 ]
 
 
 def building_address(b: dict) -> str:
-    return f"{b['street']} {b['house_number']}, {b['zip_code']}"
+    number = str(b.get("house_number") or "").strip()
+    street = f"{b['street']} {number}".strip() if number else b["street"]
+    return f"{street}, {b['zip_code']}"
 
 ICON_ALIASES = {"house_sparrow": "sparrow"}
 
+# Only pairs drawn from SINGLE_SPECIES_ALLOWLIST. ("house_sparrow", "swift") is
+# the one pairing that was already sanctioned; the other two are new combinations
+# of the three permitted species — drop them if they are not ecologically wanted.
 ALLOWED_SPECIES_PAIRS = [
     ("house_sparrow", "swift"),
-    ("black_redstart", "house_martin"),
-    ("starling", "common_noctule"),
-    ("starling", "common_pipistrelle"),
-    ("swift", "common_noctule"),
-    ("swift", "common_pipistrelle"),
+    ("black_redstart", "swift"),
+    ("black_redstart", "house_sparrow"),
 ]
 
 ORDINAL_WALL_LABELS = ["Best wall", "Second best wall", "Third best wall", "Fourth best wall"]
@@ -84,22 +90,18 @@ def load_model():
     return model, encoders
 
 
+# Restricted to the three species the current models were actually trained and
+# validated on in export3107. The wider list is kept below for reference —
+# re-add a species only once it carries expert labels.
 SINGLE_SPECIES_ALLOWLIST = {
-    "house_sparrow",
-    "swift",
-    "house_martin",
-    "spotted_flycatcher",
-    "robin",
-    "wagtail",
-    "great_tit",
-    "blue_tit",
-    "tree_sparrow",
     "black_redstart",
-    "starling",
-    "jackdaw",
-    "common_noctule",
-    "common_pipistrelle",
+    "swift",
+    "house_sparrow",
 }
+
+# Previously offered: house_martin, spotted_flycatcher, robin, wagtail,
+# great_tit, blue_tit, tree_sparrow, starling, jackdaw, common_noctule,
+# common_pipistrelle
 
 
 @st.cache_data
@@ -501,6 +503,15 @@ else:
 
 # --- 3D VIEW ---
 fig_ph.plotly_chart(fig, use_container_width=True, key="main_3d")
+
+# --- ADVISORY NOTE ---
+st.markdown(
+    "<div style='text-align:center;opacity:0.7;font-size:0.9rem;"
+    "margin-top:0.25rem;'>Proposed placement serves as a guideline, "
+    "please consult ecologists for the final approval.</div>",
+    unsafe_allow_html=True,
+)
+
 st.markdown("<div style='height:80px'></div>", unsafe_allow_html=True)
 
 # --- ICON ROW BELOW THE 3D VIEW ---

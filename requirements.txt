@@ -4,7 +4,10 @@ pandas==2.3.3
 plotly==6.5.2
 joblib==1.5.3
 shapely
-xgboost==2.0.3
+# Must be >= the version that WROTE demo_data/models/*.pkl — the saved booster
+# reports version [3, 2, 0], and XGBoost cannot load a model produced by a newer
+# release. Was pinned to 2.0.3, which would fail on the retrained model.
+xgboost==3.2.0
 scikit-learn
 openpyxl==3.1.5
 -e .
