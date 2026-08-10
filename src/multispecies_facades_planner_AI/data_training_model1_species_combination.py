@@ -152,7 +152,7 @@ def _rank_viable_walls_for_species(
     viable = []
     for wid in ranked_wall_ids:
         wall = building_dict[wid]
-        usable_geom, _ = _wall_usable_geometry(wall)
+        usable_geom, _ = _wall_usable_geometry(wall, needs)
         if usable_geom is None:
             continue
         all_sectors = _get_all_sectors(building_dict, wid)
@@ -258,8 +258,12 @@ def _select_sector_pair_on_shared_wall(
     building_zero_z: float,
 ):
     wall = building_dict[wall_id]
-    usable_geom, _ = _wall_usable_geometry(wall)
-    if usable_geom is None:
+    # One usable area per species — the window-offset rules differ between
+    # colonial and solitary species, so a shared geometry would be wrong for
+    # whichever of the two it was not computed for.
+    usable_geom_1, _ = _wall_usable_geometry(wall, needs1)
+    usable_geom_2, _ = _wall_usable_geometry(wall, needs2)
+    if usable_geom_1 is None or usable_geom_2 is None:
         return None
 
     all_sectors = _get_all_sectors(building_dict, wall_id)
@@ -267,11 +271,11 @@ def _select_sector_pair_on_shared_wall(
         return None
 
     sectors_1 = _feasible_scored_sectors(
-        building_dict, wall_id, wall, usable_geom, all_sectors, needs1,
+        building_dict, wall_id, wall, usable_geom_1, all_sectors, needs1,
         model, model_type, xgb_encoders, height_min1, height_max1, colony_min1, building_zero_z,
     )
     sectors_2 = _feasible_scored_sectors(
-        building_dict, wall_id, wall, usable_geom, all_sectors, needs2,
+        building_dict, wall_id, wall, usable_geom_2, all_sectors, needs2,
         model, model_type, xgb_encoders, height_min2, height_max2, colony_min2, building_zero_z,
     )
     if not sectors_1 or not sectors_2:
@@ -410,7 +414,7 @@ def _place_one_species_avoiding_other(
     # same wall, keeping every candidate sector's points far enough from the
     # other species' existing points.
     wall = building_dict[wall_id]
-    usable_geom, _ = _wall_usable_geometry(wall)
+    usable_geom, _ = _wall_usable_geometry(wall, needs)
     if usable_geom is None:
         return None
     all_sectors = _get_all_sectors(building_dict, wall_id)

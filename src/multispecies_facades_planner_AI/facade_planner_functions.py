@@ -209,12 +209,22 @@ def v_axis_points_up(wall: dict) -> bool:
     return bool(y[2] > 0)
 
 
+WIN_SIDE_OFFSET_EDGE_M = 0.35     # window at the end of a floor band
+WIN_SIDE_OFFSET_BETWEEN_M = 0.85  # window with neighbours on both sides
+WIN_ABOVE_SIDE_OFFSET_M = 0.20    # sideways reach of the strip ABOVE a window
+                                  # that has nothing above it — the same on every
+                                  # such window, edge or between
+
+
 def build_offset_area(
     wall: dict,
-    win_side_offset: float = 0.35,
+    win_side_offset: float = WIN_SIDE_OFFSET_EDGE_M,
     door_side_offset: float = 0.4,
     join_style: int = 2,
     floor_gap_tol_m: float = 1.0,
+    colonial: bool = False,
+    win_side_offset_between: float = WIN_SIDE_OFFSET_BETWEEN_M,
+    win_above_side_offset: float = WIN_ABOVE_SIDE_OFFSET_M,
 ):
     """
     Hard-constraint no-nest area around windows and doors.
@@ -227,6 +237,19 @@ def build_offset_area(
         position, see _group_window_floors) — not all the way to the roof.
       - for windows on the topmost floor band (no floor above), the strip
         runs all the way up to the wall's top boundary (the roof).
+
+    colonial=True additionally applies the colony-species rules:
+      - a window at either END of its floor band (nothing between it and the
+        wall edge on that floor) keeps the narrow win_side_offset (0.35 m).
+      - a window with neighbours on BOTH sides gets win_side_offset_between
+        (0.80 m), because the pier it shares is flanked by two windows.
+      - for a window with nothing above it in its own column, the strip running
+        up to the roof reaches win_above_side_offset (0.20 m) to each side —
+        the same for every such window, edge or between. The wider side band is
+        cut off at that window's top edge so it cannot bleed into this region.
+
+    Solitary species keep the flat 0.35 m behaviour (colonial defaults False),
+    so nothing changes for them.
     """
     wall_uv = wall.get("boundary_uv")
     if not wall_uv or len(wall_uv) < 3:
@@ -243,7 +266,20 @@ def build_offset_area(
     windows = wall.get("windows") or {}
     window_floors = _group_window_floors(windows, v_up, floor_gap_tol_m=floor_gap_tol_m)
 
-    def opening_offset_geom(opening_uv, side_offset, next_floor_top_v=None):
+    def opening_offset_geom(opening_uv, side_offset, next_floor_top_v=None,
+                            above_side_offset=None, clip_band_at_top=False):
+        # above_side_offset controls how far the "above" strip reaches sideways.
+        # Defaults to side_offset; pass 0.0 to make the strip span only the
+        # opening's own width (top-floor rule for colonial species).
+        #
+        # clip_band_at_top cuts the side band off at the opening's top edge. The
+        # band is a buffer, so it otherwise also bulges side_offset ABOVE the
+        # opening — which would widen the region between a top-floor window and
+        # the roof. With this set, everything above the window top is exactly
+        # the window's own width and nothing wider.
+        if above_side_offset is None:
+            above_side_offset = side_offset
+
         if not opening_uv or len(opening_uv) < 3:
             return None
 
@@ -264,6 +300,16 @@ def build_offset_area(
         opening_top_v = op_max_v if v_up else op_min_v
         wall_top_v    = max_v    if v_up else min_v
 
+        # cut the band at the opening's top edge so it cannot widen the area
+        # above it (top-floor rule)
+        if clip_band_at_top:
+            pad = max(side_offset, 1.0) + 1.0
+            keep = (
+                box(min_u - pad, min_v - pad, max_u + pad, opening_top_v) if v_up
+                else box(min_u - pad, opening_top_v, max_u + pad, max_v + pad)
+            )
+            band = band.intersection(keep)
+
         # If opening is already at/above top (or numerical weirdness), skip above strip safely
         if (v_up and opening_top_v >= wall_top_v) or ((not v_up) and opening_top_v <= wall_top_v):
             above_strip = Polygon()
@@ -281,9 +327,9 @@ def build_offset_area(
 
             v0, v1 = sorted([opening_top_v, strip_top_v])
             above_strip = box(
-                op_min_u - side_offset,
+                op_min_u - above_side_offset,
                 v0,
-                op_max_u + side_offset,
+                op_max_u + above_side_offset,
                 v1
             )
 
@@ -292,19 +338,116 @@ def build_offset_area(
 
         return band_clipped.union(above_clipped)
 
+    # Colony rule: which windows sit at the ends of their floor band? Those are
+    # the ones with open wall between them and the wall edge, so they keep the
+    # narrow offset. Everything else has a window on both sides.
+    edge_window_ids = set()
+    if colonial:
+        for band in window_floors:
+            spans = []
+            for wid in band.get("window_ids") or []:
+                hull = (windows.get(wid) or {}).get("hull_uv")
+                if not hull or len(hull) < 3:
+                    continue
+                us = [p[0] for p in hull]
+                spans.append((min(us), max(us), wid))
+            if not spans:
+                continue
+
+            # Merge overlapping U spans into COLUMNS first. Several windows can
+            # share one column — stacked panes, or floors close enough that the
+            # banding tolerance groups them together. They sit at the same U, so
+            # the union of their bands is what is actually seen: classifying them
+            # individually let one window's 0.85 m swallow its neighbour's 0.35 m
+            # and the outermost column stopped reading as an edge at all.
+            spans.sort(key=lambda s: s[0])
+            columns = []
+            cur_u0, cur_u1, ids = spans[0][0], spans[0][1], [spans[0][2]]
+            for u0, u1, wid in spans[1:]:
+                if u0 <= cur_u1 + 1e-9:          # overlaps the column so far
+                    cur_u1 = max(cur_u1, u1)
+                    ids.append(wid)
+                else:
+                    columns.append(ids)
+                    cur_u0, cur_u1, ids = u0, u1, [wid]
+            columns.append(ids)
+
+            edge_window_ids.update(columns[0])    # leftmost column on this floor
+            edge_window_ids.update(columns[-1])   # rightmost column on this floor
+
+    # U span + band index per window, so "is anything above THIS window?" can be
+    # answered per column. Membership of the global top band is not the same
+    # question: on a stepped roofline, or wherever the top band does not span
+    # the whole facade, a window can be the highest one in its own column while
+    # sitting on a lower band.
+    win_span = {}
+    for wid, w in windows.items():
+        hull = w.get("hull_uv")
+        if not hull or len(hull) < 3:
+            continue
+        us = [p[0] for p in hull]
+        win_span[wid] = (min(us), max(us), _window_floor_index(window_floors, wid))
+
+    def windows_above(win_id):
+        me = win_span.get(win_id)
+        if me is None or me[2] is None:
+            return []
+        u0, u1, bi = me
+        return [
+            other for other, (o0, o1, oi) in win_span.items()
+            if other != win_id and oi is not None and oi > bi
+            and o1 > u0 + 1e-9 and o0 < u1 - 1e-9
+        ]
+
+    def top_v_of(win_id):
+        vs = [p[1] for p in windows[win_id]["hull_uv"]]
+        return max(vs) if v_up else min(vs)
+
     pieces = []
 
     for win_id, win in windows.items():
         floor_idx = _window_floor_index(window_floors, win_id)
-        next_floor_top_v = None
-        if floor_idx is not None and floor_idx < len(window_floors) - 1:
-            next_tops = window_floors[floor_idx + 1]["tops"]
-            if next_tops:
-                # the outermost top line among the next floor's windows, so the
-                # strip never falls short of any of them
-                next_floor_top_v = max(next_tops) if v_up else min(next_tops)
 
-        g = opening_offset_geom(win.get("hull_uv"), win_side_offset, next_floor_top_v=next_floor_top_v)
+        if colonial:
+            # anchor on the windows genuinely above this one, in its own column
+            above_ids = windows_above(win_id)
+            next_floor_top_v = None
+            if above_ids:
+                tops_above = [top_v_of(o) for o in above_ids]
+                # NEAREST one, so the widened strip cannot overshoot past it and
+                # widen the area above a window that is itself a top window
+                next_floor_top_v = min(tops_above) if v_up else max(tops_above)
+            # "last floor" = nothing above it in its column
+            is_top_floor = not above_ids
+        else:
+            # unchanged behaviour for solitary species
+            next_floor_top_v = None
+            if floor_idx is not None and floor_idx < len(window_floors) - 1:
+                next_tops = window_floors[floor_idx + 1]["tops"]
+                if next_tops:
+                    # the outermost top line among the next floor's windows, so
+                    # the strip never falls short of any of them
+                    next_floor_top_v = max(next_tops) if v_up else min(next_tops)
+            is_top_floor = False
+
+        if colonial:
+            side = (win_side_offset if win_id in edge_window_ids
+                    else win_side_offset_between)
+            # Nothing above it in its column: from its top edge up to the roof
+            # the exclusion is the window's width plus a fixed 0.20 m each side,
+            # regardless of whether it is an edge or between window. The wider
+            # side band is clipped at that top edge so only the 0.20 m applies.
+            above_side = win_above_side_offset if is_top_floor else side
+        else:
+            side = win_side_offset
+            above_side = None
+
+        g = opening_offset_geom(
+            win.get("hull_uv"), side,
+            next_floor_top_v=next_floor_top_v,
+            above_side_offset=above_side,
+            clip_band_at_top=is_top_floor,
+        )
         if g and not g.is_empty:
             pieces.append(g)
 

@@ -36,6 +36,14 @@ ALL_ORIENTATIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 # Set to False (2026-08-04) so inference matches the generator exactly. Flip it
 # back to True to reinstate the cap — nothing else needs to change.
 ENFORCE_MAX_HEIGHT = False
+
+# Minimum usable facade area for a wall to be considered at all, applied in
+# _is_wall_hard_excluded alongside the floor_function exclusion.
+#
+# Raised from 2.0 to 2.5 on 2026-08-04. The 2.0 threshold let 5128-wall-00
+# through at 2.23 m2 — a 1.56 m tall parapet-sized element that is not a real
+# nesting facade.
+MIN_WALL_FREE_AREA_M2 = 2.5
  
 # MUST stay identical to data_training_model1.ALL_FEATURES — a feature listed
 # there but not built here silently arrives as NaN at inference.
@@ -213,15 +221,23 @@ def _is_wall_hard_excluded(wall_id: str, wall: dict) -> bool:
     if floor_fn in {"neighbor_building", "neigbor_building"}:
         return True
  
-    # exclude walls with negligible free area — too small to place anything
+    # exclude walls with negligible free area — too small to place anything.
+    # Computed on the spot when plan() has not stamped it onto the wall yet,
+    # so the check can never silently no-op.
     free_area = wall.get("wall_free_area_m2")
+    if free_area is None:
+        try:
+            free_area = fpf.free_wall_area(wall)
+        except Exception:
+            free_area = None
+
     if free_area is not None:
         try:
-            if float(free_area) < 2.0:
+            if float(free_area) < MIN_WALL_FREE_AREA_M2:
                 return True
         except (ValueError, TypeError):
             pass
- 
+
     return False
  
  
@@ -337,11 +353,17 @@ def _get_sector_feasible_points(
     return pts
  
  
-def _wall_usable_geometry(wall: dict):
+def _wall_usable_geometry(wall: dict, needs: dict | None = None):
     # Computes the usable area polygon for this wall (openings removed, offset applied).
     # Returns usable_geom and wall_ground_z, or (None, None) if wall is unusable.
+    #
+    # `needs` selects the window-offset rules: colony species get the wider
+    # between-windows band and the top-floor window-width strip, matching
+    # facade_planner.base_candidates_for_wall. Omitting it keeps the flat 0.35 m.
+    colonial = _species_fields(needs).get("colonial") == 1 if needs else False
+
     free_geom   = fpf.derive_openings(wall)
-    offset_geom = fpf.build_offset_area(wall)
+    offset_geom = fpf.build_offset_area(wall, colonial=colonial)
     usable_geom = free_geom.difference(offset_geom)
  
     if usable_geom.is_empty:
@@ -1083,7 +1105,7 @@ def _try_place_on_wall(
     # Returns a placement dict or None.
     wall = building_dict[wall_id]
  
-    usable_geom, _ = _wall_usable_geometry(wall)
+    usable_geom, _ = _wall_usable_geometry(wall, needs)
     if usable_geom is None:
         return None
  
@@ -1362,7 +1384,7 @@ def plan(
             break
         # quick feasibility check — does this wall have any feasible sectors?
         wall = building_dict[wid]
-        usable_geom, _ = _wall_usable_geometry(wall)
+        usable_geom, _ = _wall_usable_geometry(wall, needs)
         if usable_geom is None:
             continue
         all_sectors = _get_all_sectors(building_dict, wid)

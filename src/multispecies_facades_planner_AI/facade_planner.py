@@ -94,8 +94,16 @@ def base_candidates_for_wall(
     """
     wall = building_dict[wall_id]
 
+    # Colony species get the wider between-windows offset and the top-floor
+    # window-width strip (see fpf.build_offset_area); solitary species keep the
+    # flat 0.35 m. Same "colonie == yes" test encode_species_traits uses.
+    colonial = (
+        str((needs or {}).get("colonie") or "")
+        .strip().lower().replace('"', "") == "yes"
+    )
+
     free_geom = fpf.derive_openings(wall)
-    offset_geom = fpf.build_offset_area(wall)
+    offset_geom = fpf.build_offset_area(wall, colonial=colonial)
     usable_geom = free_geom.difference(offset_geom)
 
     if usable_geom.is_empty:
@@ -270,17 +278,27 @@ def build_one_colony_on_wall(
             else size_min
         )
 
-        # bats: exact count required; other species: ±10% tolerance
-        size_tol = 0.0 if is_bat else 0.10
+        if is_bat:
+            # Bats get exactly ONE roost per candidate, whatever
+            # colonie_size_local says. A bat box is a single installed unit
+            # housing a colony internally — it is not a cluster of separate
+            # boxes the way a swift or sparrow colony is — so a candidate
+            # should represent one placement, not N of them.
+            size_min = size_max = 1
+            min_allowed_colony_size = 1
+            max_allowed_colony_size = 1
+        else:
+            # ±10% tolerance around the sheet's colony size
+            size_tol = 0.10
 
-        min_allowed_colony_size = max(
-            1,
-            int(math.floor(size_min * (1.0 - size_tol))),
-        )
+            min_allowed_colony_size = max(
+                1,
+                int(math.floor(size_min * (1.0 - size_tol))),
+            )
 
-        max_allowed_colony_size = int(
-            math.ceil(size_max * (1.0 + size_tol))
-        )
+            max_allowed_colony_size = int(
+                math.ceil(size_max * (1.0 + size_tol))
+            )
 
         dist_raw = (
             specie1_needs.get("distance_to_next_nest")
