@@ -6,9 +6,18 @@ import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
 
+from shapely.geometry import Point, box
+from shapely.ops import triangulate, unary_union
+
 from multispecies_facades_planner_AI import facade_planner_functions as fpf
+from multispecies_facades_planner_AI import facade_planner_species as fps
 from multispecies_facades_planner_AI import data_extraction as de
-from multispecies_facades_planner_AI.data_training_model1_test import plan
+from multispecies_facades_planner_AI.data_training_model1_test import (
+    plan,
+    _parse_box_spacing,
+    _parse_colony_size,
+    _parse_solitary_boxes,
+)
 from multispecies_facades_planner_AI.data_training_model1_species_combination import plan_species_combination
 
 APP_DIR = Path(__file__).parent.resolve()
@@ -210,13 +219,193 @@ def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name=
     )
 
 
-def add_placement_points_and_circles(fig, placement: dict, walls_data: dict, color: str, radius_m=0.10, label=""):
+# ─────────────────────────────────────────────────────────────────
+# PLACEMENT AREA
+# ─────────────────────────────────────────────────────────────────
+
+# Intensity of the placement-area fill relative to the nest markers.
+# 0.50 -> 0.35 (toned down 15pp) -> 0.50 (back up 15pp on request).
+PLACEMENT_AREA_OPACITY = 0.50
+
+# Only used if a wall's spacing cannot be read off its own grid.
+GRID_SIZE_FALLBACK_M = 0.30
+
+
+def wall_grid_size(wall: dict):
+    """
+    Grid spacing of this wall as (du, dv), measured from its own grid rather
+    than assumed, so it follows automatically if the export grid ever changes.
+
+    u and v spacing are returned separately because they differ slightly in the
+    exports (e.g. 0.2976 vs 0.2956) — averaging them leaves hairline gaps
+    between the cells that make up the placement area.
+    """
+    grid = wall.get("grid") or {}
+    steps = []
+    for axis in (0, 1):
+        vals = sorted({round(float(p["uv"][axis]), 4)
+                       for p in grid.values() if p.get("uv")})
+        deltas = [b - a for a, b in zip(vals, vals[1:]) if b - a > 0.01]
+        steps.append(float(np.median(deltas)) if deltas else GRID_SIZE_FALLBACK_M)
+    return steps[0], steps[1]
+
+
+def placement_area_geom(wall: dict, placement: dict, needs: dict):
+    """
+    Placeable area around one placement, in the wall's own UV frame.
+
+    The outermost nests define an axis-aligned rectangle; it is grown by one
+    grid cell on every side, then reduced to the grid positions that actually
+    pass the hard constraints — window/door offsets, the species minimum
+    height, and the 1.5 m roof band where the species requires it.
+
+    Returns a shapely geometry, or None when nothing qualifies.
+    """
+    uvs = placement.get("uv") or []
+    if not uvs:
+        return None
+
+    du, dv = wall_grid_size(wall)
+    us = [float(p[0]) for p in uvs]
+    vs = [float(p[1]) for p in uvs]
+    envelope = box(min(us) - du, min(vs) - dv, max(us) + du, max(vs) + dv)
+    e_u0, e_v0, e_u1, e_v1 = envelope.bounds
+
+    colonial = fps.encode_species_traits(needs).get("colonial") == 1
+    usable = fpf.derive_openings(wall).difference(
+        fpf.build_offset_area(wall, colonial=colonial)
+    )
+    if usable.is_empty:
+        return None
+
+    grid = wall.get("grid") or {}
+    zs = [float(p["point_on_wall"][2]) for p in grid.values() if p.get("point_on_wall")]
+    ground = min(zs) if zs else 0.0
+    min_h = fpf.parse_min_height_m(needs.get("nest_height"), 0.0)
+    roof_strict = fpf.is_distance_to_roof_strict(needs.get("distance_to_roof"))
+    boundary_uv = wall.get("boundary_uv") or []
+    v_up = fpf.v_axis_points_up(wall)
+
+    # 2% oversize so neighbouring cells overlap instead of leaving hairline
+    # seams; the final intersection below restores the true outer boundary
+    hu, hv = du * 0.51, dv * 0.51
+    cells = []
+    for p in grid.values():
+        uv, xyz = p.get("uv"), p.get("point_on_wall")
+        if not uv or not xyz:
+            continue
+        u, v = float(uv[0]), float(uv[1])
+        if not (e_u0 <= u <= e_u1 and e_v0 <= v <= e_v1):
+            continue
+        if not usable.contains(Point(u, v)):
+            continue
+        if float(xyz[2]) - ground < min_h - 1e-6:
+            continue
+        if roof_strict and not fpf.is_within_roof_strict_band(
+            boundary_uv, u, v, v_up=v_up
+        ):
+            continue
+        cells.append(box(u - hu, v - hv, u + hu, v + hv))
+
+    if not cells:
+        return None
+
+    area = unary_union(cells).intersection(envelope).intersection(usable)
+    return None if area.is_empty else area
+
+
+def add_placement_area(fig, wall: dict, geom, color: str, label: str):
+    """Fill the placeable area on the wall plane, at half the nest intensity."""
+    plane = wall.get("plane")
+    if plane is None or geom is None or geom.is_empty:
+        return
+
+    o = np.asarray(plane["origin"], dtype=float)
+    ux = np.asarray(plane["xaxis"], dtype=float)
+    uy = np.asarray(plane["yaxis"], dtype=float)
+    ux = ux / (np.linalg.norm(ux) + 1e-12)
+    uy = uy / (np.linalg.norm(uy) + 1e-12)
+
+    verts, faces = [], []
+    for tri in triangulate(geom):
+        # triangulate() covers the convex hull, so drop anything that falls in a
+        # concavity or a hole cut by the hard constraints
+        if not geom.contains(tri.centroid):
+            continue
+        base = len(verts)
+        for u, v in list(tri.exterior.coords)[:3]:
+            verts.append(o + float(u) * ux + float(v) * uy)
+        faces.append((base, base + 1, base + 2))
+
+    if not faces:
+        return
+
+    V = np.asarray(verts, dtype=float)
+    fig.add_trace(
+        go.Mesh3d(
+            x=V[:, 0], y=V[:, 1], z=V[:, 2],
+            i=[f[0] for f in faces],
+            j=[f[1] for f in faces],
+            k=[f[2] for f in faces],
+            color=color,
+            opacity=PLACEMENT_AREA_OPACITY,
+            flatshading=True,
+            name=f"area_{label}",
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+
+
+def _fmt_range(lo, hi, decimals=0):
+    """'3' when both ends match, otherwise '3-10'."""
+    def one(x):
+        return f"{x:.{decimals}f}".rstrip("0").rstrip(".") if decimals else f"{int(round(x))}"
+    return one(lo) if abs(hi - lo) < 1e-9 else f"{one(lo)}–{one(hi)}"
+
+
+def placement_field_caption(needs: dict) -> str:
+    """
+    How many boxes this species takes, and how far apart, straight from the
+    species sheet — colony species use colonie_size_local + distance_to_next_nest,
+    solitary ones number_of_individual_nest_boxes_on_building +
+    distance_between_nest_boxes, matching what the planner itself reads.
+    """
+    traits = fps.encode_species_traits(needs)
+    colonial = traits.get("colonial") == 1
+
+    if colonial:
+        lo, hi = _parse_colony_size(needs)
+        d_lo, d_hi = traits.get("nest_distance_min_m"), traits.get("nest_distance_max_m")
+    else:
+        lo, hi = _parse_solitary_boxes(needs)
+        d_lo, d_hi = _parse_box_spacing(needs)
+
+    count = _fmt_range(lo, hi)
+
+    def bad(x):
+        return x is None or (isinstance(x, float) and (x != x or x >= 1e8))
+
+    if bad(d_lo) or bad(d_hi):
+        return f"{count} nests could be placed in the shown fields."
+    return (f"{count} nests could be placed in the shown fields "
+            f"within {_fmt_range(d_lo, d_hi, decimals=1)} m distance.")
+
+
+def add_placement_points_and_circles(fig, placement: dict, walls_data: dict, color: str,
+                                     radius_m=0.10, label="", needs=None):
     wall_id = placement["wall_id"]
     wall = walls_data.get(wall_id, {})
     plane = wall.get("plane")
     pts = placement.get("xyz") or []
     if not pts:
         return
+
+    # area first, so the nest markers draw on top of it
+    if needs is not None:
+        add_placement_area(
+            fig, wall, placement_area_geom(wall, placement, needs), color, label
+        )
     P = np.asarray(pts, dtype=float)
     fig.add_trace(
         go.Scatter3d(
@@ -431,6 +620,9 @@ if mode == "Single species":
         option_labels = ["Option 1 (best)", "Option 2"][: len(options)]
 
         st.sidebar.header("Results")
+        st.sidebar.caption(
+            placement_field_caption(load_needs(st.session_state.single_species))
+        )
         current_idx = min(st.session_state.get("single_option_idx", 0), len(options) - 1)
         picked = st.sidebar.radio(
             "Show option", option_labels, index=current_idx, horizontal=True, key="single_option_radio"
@@ -445,7 +637,10 @@ if mode == "Single species":
             placement = placements[p_idx]
             color = COLOR_A if rank == 1 else COLOR_B
             label = ordinal_wall_label(rank)
-            add_placement_points_and_circles(fig, placement, walls_data, color=color, label=label)
+            add_placement_points_and_circles(
+                fig, placement, walls_data, color=color, label=label,
+                needs=load_needs(st.session_state.single_species),
+            )
             st.sidebar.markdown(f"{color_dot_html(color)}**{label}**", unsafe_allow_html=True)
             st.sidebar.caption(placement_caption(walls_data, placement))
 
@@ -486,13 +681,15 @@ else:
         st.sidebar.header("Results")
         for sp_name, color in [(sp_a, COLOR_A), (sp_b, COLOR_B)]:
             st.sidebar.markdown(f"{color_dot_html(color)}**{nice_species_label(sp_name)}**", unsafe_allow_html=True)
+            st.sidebar.caption(placement_field_caption(load_needs(sp_name)))
             placements = combination_result.get(sp_name, [])
             if not placements:
                 st.sidebar.caption("No placement found.")
                 continue
             for placement in placements:
                 add_placement_points_and_circles(
-                    fig, placement, walls_data, color=color, label=nice_species_label(sp_name)
+                    fig, placement, walls_data, color=color,
+                    label=nice_species_label(sp_name), needs=load_needs(sp_name),
                 )
                 st.sidebar.caption(placement_caption(walls_data, placement))
 
