@@ -1276,6 +1276,80 @@ def is_distance_to_roof_strict(val) -> bool:
     return s == "strict"
 
 
+# Species-sheet vocabularies. Three ordinal scales read off bird_species.xlsx,
+# sharing one cleaner: the sheet is inconsistent about quoting, non-breaking
+# spaces and dash characters, and duplicating that cleaning is precisely how the
+# two 2026-09-08 bugs happened - the proximity flags compared against wording the
+# sheet no longer used, and tolerance_to_human lacked the "medium-high" half-step
+# that the adjacent dirt map already had.
+
+PROXIMITY_STRENGTH = {"strict": 1.0, "close": 0.5}      # distance_to_edges / distance_to_roof
+WINDOW_STRENGTH = {"important": 1.0, "medium": 0.5}     # far_from_windows
+LEVEL_STRENGTH = {                                      # species_noise / tolerance_to_human / dirt
+    "low": 0.0,
+    "low-medium": 0.5,
+    "medium": 1.0,
+    "medium-high": 1.5,
+    "high": 2.0,
+}
+
+
+def clean_sheet_value(val) -> str:
+    """
+    Normalise one raw species-sheet cell to a bare lowercase token. Strips
+    quotes, non-breaking spaces, en/em/non-breaking dashes and surrounding
+    whitespace, and collapses spacing around a hyphen, so "medium - high",
+    "medium–high" and '"Medium-High"' all read as "medium-high".
+
+    Blank cells and NaN come back as "".
+    """
+    if val is None:
+        return ""
+    s = (
+        str(val)
+        .strip()
+        .lower()
+        .replace('"', "")
+        .replace(" ", " ")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("‑", "-")
+        .strip()
+    )
+    s = re.sub(r"\s*-\s*", "-", s)
+    s = re.sub(r"\s+", " ", s)
+    return "" if s == "nan" else s
+
+
+def proximity_strength(val) -> float:
+    """
+    Strength of a distance_to_edges / distance_to_roof value: 1.0 ("strict"),
+    0.5 ("close"), 0.0 (blank or unrecognised). Blank is a genuine zero - the
+    species states no proximity preference.
+    """
+    return PROXIMITY_STRENGTH.get(clean_sheet_value(val), 0.0)
+
+
+def window_strength(val) -> float:
+    """
+    Strength of a far_from_windows value: 1.0 ("important"), 0.5 ("medium"),
+    0.0 (blank or unrecognised). Blank is a genuine zero - no stated need to
+    sit away from windows.
+    """
+    return WINDOW_STRENGTH.get(clean_sheet_value(val), 0.0)
+
+
+def level_strength(val) -> float:
+    """
+    Ordinal level for a low/medium/high field, including the "low-medium" and
+    "medium-high" half-steps. Returns np.nan for blanks and anything
+    unrecognised, so a bad cell stays visible rather than defaulting to a level
+    (bird_species.xlsx currently holds dirt == "1" for wagtail, which lands here).
+    """
+    s = clean_sheet_value(val)
+    return LEVEL_STRENGTH.get(s, np.nan) if s else np.nan
+
+
 def is_within_roof_strict_band(
     boundary_uv,
     px: float,

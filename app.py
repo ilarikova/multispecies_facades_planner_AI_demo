@@ -2,6 +2,7 @@ import re
 import joblib
 import numpy as np
 import pandas as pd
+import plotly.colors as pc
 import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
@@ -25,8 +26,11 @@ DATA_DIR = APP_DIR / "demo_data"
 ICONS_DIR = DATA_DIR / "icons"
 
 EXCEL_PATH = DATA_DIR / "bird_species.xlsx"
-XGB_RANKER_PATH = DATA_DIR / "models" / "nestworks_xgb_ranker_reduced.pkl"
-XGB_ENCODERS_PATH = DATA_DIR / "models" / "nestworks_xgb_encoders_reduced.pkl"
+# Final model: XGBoost trained on all 239 labelled iterations (5 buildings,
+# 6 species, reduced feature set, 500 trees). Replaces the earlier model that
+# had seen only 4 species. Written by xgboost 3.2.0, matching requirements.txt.
+XGB_RANKER_PATH = DATA_DIR / "models" / "nestworks_xgb_ranker_final.pkl"
+XGB_ENCODERS_PATH = DATA_DIR / "models" / "nestworks_encoders_final.pkl"
 MODEL_TYPE = "xgb"
 
 COLOR_A = "#F4A623"  # orange — best placement (single mode) / species A (combination mode)
@@ -55,13 +59,15 @@ def building_address(b: dict) -> str:
 
 ICON_ALIASES = {"house_sparrow": "sparrow"}
 
-# Only pairs drawn from SINGLE_SPECIES_ALLOWLIST. ("house_sparrow", "swift") is
-# the one pairing that was already sanctioned; the other two are new combinations
-# of the three permitted species — drop them if they are not ecologically wanted.
+# The pairings that are ecologically wanted: house sparrow with swift, each of
+# them with either bat, and nothing else. Both members must be in
+# SINGLE_SPECIES_ALLOWLIST.
 ALLOWED_SPECIES_PAIRS = [
     ("house_sparrow", "swift"),
-    ("black_redstart", "swift"),
-    ("black_redstart", "house_sparrow"),
+    ("house_sparrow", "common_noctule"),
+    ("house_sparrow", "common_pipistrelle"),
+    ("swift", "common_noctule"),
+    ("swift", "common_pipistrelle"),
 ]
 
 ORDINAL_WALL_LABELS = ["Best wall", "Second best wall", "Third best wall", "Fourth best wall"]
@@ -88,6 +94,10 @@ def color_dot_html(color: str) -> str:
 @st.cache_resource
 def load_building(building_path: str) -> dict:
     building_dict = fpf.load_building_dict(building_path)
+    # Both are also done inside plan(), but the radiation view is drawn before
+    # anything is planned - without the climate medians it has nothing to shade,
+    # and since that view is cached it stayed blank even after the first run.
+    fpf.precompute_wall_climate_features(building_dict)
     fpf.precompute_wall_orientations(building_dict)
     return building_dict
 
@@ -99,18 +109,33 @@ def load_model():
     return model, encoders
 
 
-# Restricted to the three species the current models were actually trained and
-# validated on in export3107. The wider list is kept below for reference —
-# re-add a species only once it carries expert labels.
-SINGLE_SPECIES_ALLOWLIST = {
+# The six species the deployed model was trained and validated on in export3107,
+# in the order they are offered: birds first, bats last. Add a species only once
+# it carries expert labels; without them the model has never seen its trait
+# values in a labelled ranking group.
+SPECIES_ORDER = [
     "black_redstart",
-    "swift",
     "house_sparrow",
-}
+    "swift",
+    "house_martin",
+    "common_noctule",
+    "common_pipistrelle",
+]
+SINGLE_SPECIES_ALLOWLIST = set(SPECIES_ORDER)
 
-# Previously offered: house_martin, spotted_flycatcher, robin, wagtail,
-# great_tit, blue_tit, tree_sparrow, starling, jackdaw, common_noctule,
-# common_pipistrelle
+# How each species is placed, once the model has ranked walls and sectors:
+#   roofline    — swift and house martin go in a horizontal line directly under
+#                 the roof, the LBV's requirement for both.
+#   per_facade  — the two bats get two boxes on every facade the hard
+#                 constraints allow, at the spacing from the species sheet.
+#   irregular / symmetric — of the rest, only the house sparrow is offered the
+#                 regular-grid alternative to the clustered placement.
+ROOFLINE_SPECIES = {"swift", "house_martin"}
+PER_FACADE_SPECIES = {"common_noctule", "common_pipistrelle"}
+STYLE_CHOICE_SPECIES = {"house_sparrow"}
+
+# Not yet labelled: spotted_flycatcher, robin, wagtail, great_tit, blue_tit,
+# tree_sparrow, starling, jackdaw
 
 
 @st.cache_data
@@ -118,7 +143,7 @@ def species_choices() -> list[str]:
     df = pd.read_excel(EXCEL_PATH)
     vals = df["specie_name_EN"].dropna().astype(str).str.strip()
     all_species = {v[: -len("_core")] for v in vals if v.endswith("_core")}
-    return sorted(all_species & SINGLE_SPECIES_ALLOWLIST)
+    return [s for s in SPECIES_ORDER if s in all_species]
 
 
 @st.cache_data
@@ -314,7 +339,7 @@ def placement_area_geom(wall: dict, placement: dict, needs: dict):
     return None if area.is_empty else area
 
 
-def add_placement_area(fig, wall: dict, geom, color: str, label: str):
+def add_placement_area(fig, wall: dict, geom, color: str, label: str, opacity=None):
     """Fill the placeable area on the wall plane, at half the nest intensity."""
     plane = wall.get("plane")
     if plane is None or geom is None or geom.is_empty:
@@ -348,7 +373,7 @@ def add_placement_area(fig, wall: dict, geom, color: str, label: str):
             j=[f[1] for f in faces],
             k=[f[2] for f in faces],
             color=color,
-            opacity=PLACEMENT_AREA_OPACITY,
+            opacity=PLACEMENT_AREA_OPACITY if opacity is None else opacity,
             flatshading=True,
             name=f"area_{label}",
             showlegend=False,
@@ -364,7 +389,7 @@ def _fmt_range(lo, hi, decimals=0):
     return one(lo) if abs(hi - lo) < 1e-9 else f"{one(lo)}–{one(hi)}"
 
 
-def placement_field_caption(needs: dict) -> str:
+def placement_field_caption(needs: dict, species_name: str = "") -> str:
     """
     How many boxes this species takes, and how far apart, straight from the
     species sheet — colony species use colonie_size_local + distance_to_next_nest,
@@ -386,9 +411,12 @@ def placement_field_caption(needs: dict) -> str:
     def bad(x):
         return x is None or (isinstance(x, float) and (x != x or x >= 1e8))
 
+    # the bats are not planned as one colony: every facade gets its own pair
+    subject = ("2 nests per facade" if species_name in PER_FACADE_SPECIES
+               else f"{count} nests")
     if bad(d_lo) or bad(d_hi):
-        return f"{count} nests could be placed in the shown fields."
-    return (f"{count} nests could be placed in the shown fields "
+        return f"{subject} could be placed in the shown fields."
+    return (f"{subject} could be placed in the shown fields "
             f"within {_fmt_range(d_lo, d_hi, decimals=1)} m distance.")
 
 
@@ -429,6 +457,8 @@ def add_wall_floor_function_labels(
     *,
     offset_xy_m: float = 1.5,
     z_lift_m: float = 0.2,
+    font_size: int | None = None,
+    line_gap_m: float = 1.6,
 ):
     # estimate a "ground" z from all wall meshes
     zs = []
@@ -476,8 +506,8 @@ def add_wall_floor_function_labels(
         # orientation stacks directly below floor_function, both centered on the same
         # (x, y) so the two lines read as one label rather than a single \n-joined
         # string (Scatter3d text doesn't render embedded newlines as separate lines).
-        line_gap_m = 1.6
         half_gap = line_gap_m / 2.0 if (has_ff and has_ori) else 0.0
+        font = dict(size=font_size) if font_size else None
         if has_ff:
             fig.add_trace(
                 go.Scatter3d(
@@ -485,6 +515,7 @@ def add_wall_floor_function_labels(
                     mode="text",
                     text=[str(ff)],
                     textposition="middle center",
+                    textfont=font,
                     showlegend=False,
                     name=f"ff_{wall_id}",
                 )
@@ -496,6 +527,7 @@ def add_wall_floor_function_labels(
                     mode="text",
                     text=[str(orientation).upper()],
                     textposition="middle center",
+                    textfont=font,
                     showlegend=False,
                     name=f"ori_{wall_id}",
                 )
@@ -504,6 +536,17 @@ def add_wall_floor_function_labels(
 
 @st.cache_resource
 def build_base_figure(walls_data: dict) -> go.Figure:
+    # copy first: the geometry figure is cached and shared with the climate
+    # view, which labels itself its own way
+    fig = go.Figure(_build_building_geometry(walls_data))
+    add_wall_floor_function_labels(fig, walls_data, offset_xy_m=1.5, z_lift_m=0.2)
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), scene=dict(aspectmode="data"))
+    return fig
+
+
+@st.cache_resource
+def _build_building_geometry(walls_data: dict) -> go.Figure:
+    """Walls, windows and doors only — no labels, so each view can label its own way."""
     fig = go.Figure()
     for wall_id, wall in walls_data.items():
         if not isinstance(wall, dict) or "mesh" not in wall:
@@ -539,8 +582,112 @@ def build_base_figure(walls_data: dict) -> go.Figure:
                     wall_vmin, wall_vmax, m["vertices"], OPENING_FIT_TOLERANCE_M
                 ):
                     add_mesh(fig, m, name=f"{wall_id}:{door_id}", opacity=0.45, color="royalblue")
-    add_wall_floor_function_labels(fig, walls_data, offset_xy_m=1.5, z_lift_m=0.2)
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), scene=dict(aspectmode="data"))
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLIMATE SECTOR VIEW
+# ─────────────────────────────────────────────────────────────────
+
+# Matches the PDF overview: RdYlBu reversed, so warm sectors read red.
+CLIMATE_COLORSCALE = "RdYlBu"
+CLIMATE_SECTOR_OPACITY = 0.85
+CLIMATE_VIEW_HEIGHT_PX = 420
+
+# Plotly default 3D eye is 1.25; 2.5 pulls the camera twice as far out.
+CAMERA_EYE = 2.5
+
+# The 3D scene draws the building low in its canvas and leaves an empty band
+# above it. Two knobs against that: a shorter window (cuts the band) and a
+# camera that aims below the building's own centre, which lifts the building
+# into what is left. More negative = higher in the frame.
+MAIN_VIEW_HEIGHT_PX = 560
+MAIN_VIEW_CENTER_Z = -0.35
+
+
+def _sector_climate_color(t: float) -> str:
+    """t in 0..1 -> colour. Sampled at 1-t so high climate reads red (RdYlBu_r)."""
+    t = 0.0 if t != t else min(1.0, max(0.0, float(t)))
+    return pc.sample_colorscale(CLIMATE_COLORSCALE, [1.0 - t])[0]
+
+
+@st.cache_resource
+def build_climate_figure(walls_data: dict) -> go.Figure:
+    """
+    The same building as the main view, with each wall's 3x3 climate sectors
+    shaded by their stored median - the PDF's 'building climate overview'.
+
+    Sectors are assembled from the wall's own grid points rather than from
+    rectangles cut out of the UV bbox: the grid already carries the sector
+    labels' geometry, so the shading lands exactly where the stored medians
+    were measured, and irregular wall outlines clip themselves.
+    """
+    fig = go.Figure(_build_building_geometry(walls_data))
+    # very small labels, sitting lower — this view is a quarter the width of the
+    # main one, so the default label block dominates it otherwise
+    add_wall_floor_function_labels(
+        fig, walls_data,
+        offset_xy_m=1.5, z_lift_m=-1.2, font_size=2, line_gap_m=0.27,
+    )
+
+    # one normalisation across the whole building, as the PDF does
+    medians = [
+        v for w in walls_data.values() if isinstance(w, dict)
+        for v in (w.get("sector_climate_medians_3x3") or {}).values()
+        if v is not None
+    ]
+    if not medians:
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0),
+                          scene=dict(aspectmode="data"))
+        return fig
+    vmin, vmax = float(min(medians)), float(max(medians))
+    if vmax - vmin < 1e-9:
+        vmax = vmin + 1.0
+
+    for wall_id, wall in walls_data.items():
+        if not isinstance(wall, dict) or not wall.get("boundary_uv"):
+            continue
+        if str(wall.get("floor_function") or "").strip().lower() in {
+            "neighbor_building", "neigbor_building"
+        }:
+            continue
+        sm = wall.get("sector_climate_medians_3x3") or {}
+        if not sm:
+            continue
+        bbox = fpf.wall_uv_bbox_from_building(walls_data, wall_id)
+        if bbox is None:
+            continue
+
+        du, dv = wall_grid_size(wall)
+        hu, hv = du * 0.51, dv * 0.51
+        v_up = fpf.v_axis_points_up(wall)
+
+        cells = {}
+        for p in (wall.get("grid") or {}).values():
+            uv = p.get("uv")
+            if not uv:
+                continue
+            u, v = float(uv[0]), float(uv[1])
+            row, col = fpf.sector_3x3_labels(u, v, bbox, v_up=v_up)
+            cells.setdefault("%s_%s" % (row, col), []).append(
+                box(u - hu, v - hv, u + hu, v + hv)
+            )
+
+        for key, boxes in cells.items():
+            val = sm.get(key)
+            if val is None:
+                continue
+            geom = unary_union(boxes)
+            add_placement_area(
+                fig, wall, geom,
+                _sector_climate_color((float(val) - vmin) / (vmax - vmin)),
+                "climate_%s_%s" % (wall_id, key),
+                opacity=CLIMATE_SECTOR_OPACITY,
+            )
+
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0),
+                      scene=dict(aspectmode="data"), showlegend=False)
     return fig
 
 
@@ -591,7 +738,93 @@ mode = st.sidebar.radio("Planning mode", ["Single species", "Two species (combin
 
 base_fig = build_base_figure(walls_data)
 fig = go.Figure(base_fig)
-fig_ph = st.empty()
+
+# main placement view on the left, climate reference on the right. Both are
+# live plotly scenes, so both rotate; zoom is disabled on the climate one so it
+# keeps a stable framing.
+view_col, climate_col = st.columns([3, 1])
+with view_col:
+    st.markdown("#### Nest placements")
+    fig_ph = st.empty()
+
+# drawn straight away, so picking a building shows the radiation immediately
+# instead of waiting for options to be generated
+with climate_col:
+    st.markdown("#### Incident radiation")
+    climate_fig = go.Figure(build_climate_figure(walls_data))
+    climate_fig.update_layout(
+        height=CLIMATE_VIEW_HEIGHT_PX,
+        showlegend=False,
+        scene=dict(
+            aspectmode="data",
+            dragmode="orbit",
+            camera=dict(eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6)),
+        ),
+    )
+    # height must be given to Streamlit too: its own `height` defaults to
+    # "content", which collapses a plotly 3D scene to nothing.
+    st.plotly_chart(
+        climate_fig,
+        width="stretch",
+        height=CLIMATE_VIEW_HEIGHT_PX,
+        key="climate_3d",
+        config={"scrollZoom": False, "displayModeBar": False,
+                "doubleClick": False},
+    )
+    st.caption(
+        "3×3 median solar exposure per wall. Red = warmest, blue = coolest. "
+        "Rotate to inspect; no placements shown."
+    )
+
+LAYOUT_LABELS = ["Irregular placement", "Symmetrical placement"]
+DEFAULT_STYLE = "irregular"
+
+
+def layout_from_label(label: str) -> str:
+    return "symmetric" if label.startswith("Symmetrical") else "irregular"
+
+
+def layout_for(species_name: str, style: str) -> str:
+    if species_name in ROOFLINE_SPECIES:
+        return "roofline"
+    if species_name in PER_FACADE_SPECIES:
+        return "per_facade"
+    return style if species_name in STYLE_CHOICE_SPECIES else "irregular"
+
+
+def run_single_plan(species_name: str, layout: str) -> list:
+    with st.spinner(f"Planning placements for {nice_species_label(species_name)}..."):
+        return plan(
+            model=model,
+            building_dict=walls_data,
+            species_name=species_name,
+            needs=load_needs(species_name),
+            n_options=2,
+            model_type=MODEL_TYPE,
+            xgb_encoders=xgb_encoders,
+            layout=layout,
+        )
+
+
+def run_combo_plan(species_a: str, species_b: str, style: str) -> dict:
+    with st.spinner(
+        f"Planning placements for {nice_species_label(species_a)} + "
+        f"{nice_species_label(species_b)}..."
+    ):
+        return plan_species_combination(
+            model=model,
+            building_dict=walls_data,
+            species1_name=species_a,
+            needs1=load_needs(species_a),
+            species2_name=species_b,
+            needs2=load_needs(species_b),
+            model_type=MODEL_TYPE,
+            xgb_encoders=xgb_encoders,
+            layout1=layout_for(species_a, style),
+            layout2=layout_for(species_b, style),
+        )
+
+
 icon_bytes_row: list[bytes] = []
 
 if mode == "Single species":
@@ -600,35 +833,53 @@ if mode == "Single species":
     run = st.sidebar.button("Generate options", key="generate_single")
 
     if run:
-        needs = load_needs(species_name)
-        with st.spinner(f"Planning placements for {nice_species_label(species_name)}..."):
-            options = plan(
-                model=model,
-                building_dict=walls_data,
-                species_name=species_name,
-                needs=needs,
-                n_options=2,
-                model_type=MODEL_TYPE,
-                xgb_encoders=xgb_encoders,
-            )
+        layout = layout_for(species_name, st.session_state.get("single_style", DEFAULT_STYLE))
         st.session_state.single_species = species_name
-        st.session_state.single_options = options
+        st.session_state.single_layout = layout
+        st.session_state.single_options = run_single_plan(species_name, layout)
         st.session_state.single_option_idx = 0
 
     if st.session_state.get("single_options"):
         options = st.session_state.single_options
+        shown_species = st.session_state.single_species
         option_labels = ["Option 1 (best)", "Option 2"][: len(options)]
 
         st.sidebar.header("Results")
-        st.sidebar.caption(
-            placement_field_caption(load_needs(st.session_state.single_species))
-        )
+        st.sidebar.caption(placement_field_caption(load_needs(shown_species), shown_species))
         current_idx = min(st.session_state.get("single_option_idx", 0), len(options) - 1)
         picked = st.sidebar.radio(
             "Show option", option_labels, index=current_idx, horizontal=True, key="single_option_radio"
         )
         pick_idx = option_labels.index(picked)
         st.session_state.single_option_idx = pick_idx
+
+        # Placement style belongs with the results, not with the inputs: it
+        # rearranges a colony that has already been placed, so switching it
+        # re-plans straight away instead of waiting for another button press.
+        if shown_species in STYLE_CHOICE_SPECIES:
+            current_style = st.session_state.get("single_style", DEFAULT_STYLE)
+            picked_style = layout_from_label(
+                st.sidebar.radio(
+                    "Placement style",
+                    LAYOUT_LABELS,
+                    index=LAYOUT_LABELS.index(
+                        "Symmetrical placement" if current_style == "symmetric"
+                        else "Irregular placement"
+                    ),
+                    key="layout_single",
+                    help=(
+                        "Irregular groups the nest boxes as a cluster; symmetrical "
+                        "arranges them on a regular grid, with spacing and "
+                        "orientation chosen by the model."
+                    ),
+                )
+            )
+            if picked_style != current_style:
+                st.session_state.single_style = picked_style
+                st.session_state.single_layout = picked_style
+                st.session_state.single_options = run_single_plan(shown_species, picked_style)
+                st.rerun()
+            options = st.session_state.single_options
 
         option = options[pick_idx]
         placements = option["placements"]
@@ -639,12 +890,12 @@ if mode == "Single species":
             label = ordinal_wall_label(rank)
             add_placement_points_and_circles(
                 fig, placement, walls_data, color=color, label=label,
-                needs=load_needs(st.session_state.single_species),
+                needs=load_needs(shown_species),
             )
             st.sidebar.markdown(f"{color_dot_html(color)}**{label}**", unsafe_allow_html=True)
             st.sidebar.caption(placement_caption(walls_data, placement))
 
-        icon_bytes = load_species_icon_bytes(st.session_state.single_species)
+        icon_bytes = load_species_icon_bytes(shown_species)
         if icon_bytes:
             icon_bytes_row = [icon_bytes]
 
@@ -656,32 +907,48 @@ else:
     run = st.sidebar.button("Generate options", key="generate_combo")
 
     if run:
-        needs_a = load_needs(species_a)
-        needs_b = load_needs(species_b)
-        with st.spinner(
-            f"Planning placements for {nice_species_label(species_a)} + {nice_species_label(species_b)}..."
-        ):
-            combination_result = plan_species_combination(
-                model=model,
-                building_dict=walls_data,
-                species1_name=species_a,
-                needs1=needs_a,
-                species2_name=species_b,
-                needs2=needs_b,
-                model_type=MODEL_TYPE,
-                xgb_encoders=xgb_encoders,
-            )
+        style = st.session_state.get("combo_style", DEFAULT_STYLE)
         st.session_state.combo_species = (species_a, species_b)
-        st.session_state.combo_result = combination_result
+        st.session_state.combo_style = style
+        st.session_state.combo_result = run_combo_plan(species_a, species_b, style)
 
     if st.session_state.get("combo_result"):
         sp_a, sp_b = st.session_state.combo_species
         combination_result = st.session_state.combo_result
 
         st.sidebar.header("Results")
+
+        # only the house sparrow has a style to choose; the swift's roofline and
+        # the bats' per-facade pairs are fixed, so the radio is shown when the
+        # pair contains a sparrow and applies to it alone
+        if STYLE_CHOICE_SPECIES & {sp_a, sp_b}:
+            current_style = st.session_state.get("combo_style", DEFAULT_STYLE)
+            picked_style = layout_from_label(
+                st.sidebar.radio(
+                    "Placement style",
+                    LAYOUT_LABELS,
+                    index=LAYOUT_LABELS.index(
+                        "Symmetrical placement" if current_style == "symmetric"
+                        else "Irregular placement"
+                    ),
+                    key="layout_combo",
+                    help=(
+                        "Applies to the house sparrow. Irregular groups its nest "
+                        "boxes as a cluster; symmetrical arranges them on a "
+                        "regular grid, with spacing and orientation chosen by "
+                        "the model."
+                    ),
+                )
+            )
+            if picked_style != current_style:
+                st.session_state.combo_style = picked_style
+                st.session_state.combo_result = run_combo_plan(sp_a, sp_b, picked_style)
+                st.rerun()
+            combination_result = st.session_state.combo_result
+
         for sp_name, color in [(sp_a, COLOR_A), (sp_b, COLOR_B)]:
             st.sidebar.markdown(f"{color_dot_html(color)}**{nice_species_label(sp_name)}**", unsafe_allow_html=True)
-            st.sidebar.caption(placement_field_caption(load_needs(sp_name)))
+            st.sidebar.caption(placement_field_caption(load_needs(sp_name), sp_name))
             placements = combination_result.get(sp_name, [])
             if not placements:
                 st.sidebar.caption("No placement found.")
@@ -699,7 +966,17 @@ else:
                 icon_bytes_row.append(icon_bytes)
 
 # --- 3D VIEW ---
-fig_ph.plotly_chart(fig, use_container_width=True, key="main_3d")
+fig.update_layout(
+    height=MAIN_VIEW_HEIGHT_PX,
+    scene=dict(
+        aspectmode="data",
+        camera=dict(
+            eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6),
+            center=dict(x=0, y=0, z=MAIN_VIEW_CENTER_Z),
+        ),
+    ),
+)
+fig_ph.plotly_chart(fig, width="stretch", height=MAIN_VIEW_HEIGHT_PX, key="main_3d")
 
 # --- ADVISORY NOTE ---
 st.markdown(

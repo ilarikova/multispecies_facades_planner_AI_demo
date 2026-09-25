@@ -10,3 +10,5 @@ streamlit_log.txt
 
 # Pre-sync safety copies (source + old model binaries) — never deploy these
 _prefix_backup_*/
+# Timestamped safety copies of the species sheet
+*.bak_*

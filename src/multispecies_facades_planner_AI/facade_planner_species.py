@@ -208,8 +208,6 @@ def encode_species_traits(needs: dict) -> dict:
     from multispecies_facades_planner_AI import facade_planner_functions as fpf
     from multispecies_facades_planner_AI import facade_planner as fp
 
-    LEVEL_MAP = {"low": 0, "medium": 1, "high": 2}
-
     def _clean(key):
         return (
             str(needs.get(key) or "")
@@ -226,11 +224,9 @@ def encode_species_traits(needs: dict) -> dict:
     is_bat = int(taxa == "bat")
 
     # ordinals
-    noise_level = LEVEL_MAP.get(_clean("species_noise"), np.nan)
-    human_tolerance_level = LEVEL_MAP.get(_clean("tolerance_to_human"), np.nan)
-
-    dirt_raw = _clean("dirt").replace("–", "-").replace("—", "-")
-    dirt_level = {**LEVEL_MAP, "low-medium": 0.5, "medium-high": 1.5}.get(dirt_raw, np.nan)
+    noise_level = fpf.level_strength(needs.get("species_noise"))
+    human_tolerance_level = fpf.level_strength(needs.get("tolerance_to_human"))
+    dirt_level = fpf.level_strength(needs.get("dirt"))
 
     # colonial
     colonial = int(_clean("colonie") == "yes")
@@ -276,9 +272,9 @@ def encode_species_traits(needs: dict) -> dict:
     max_height_pref = np.nan if max_height_pref is None else max_height_pref
 
     # edge / roof / window proximity preferences
-    prefers_edges = int(_clean("distance_to_edges") == "as close as possible")
-    prefers_roof = int(_clean("distance_to_roof") == "as close as possible")
-    far_from_windows_important = int(_clean("far_from_windows") == "important")
+    prefers_edges = fpf.proximity_strength(needs.get("distance_to_edges"))
+    prefers_roof = fpf.proximity_strength(needs.get("distance_to_roof"))
+    far_from_windows_important = fpf.window_strength(needs.get("far_from_windows"))
 
     # orientation preferences
     preferred_set = parse_orientation_set(needs.get("preferred_orientation"))

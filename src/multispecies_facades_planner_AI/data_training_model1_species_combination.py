@@ -16,6 +16,8 @@ from multispecies_facades_planner_AI.data_training_model1_test import (
     _get_all_sectors,
     _get_sector_feasible_points,
     _place_colony_in_sector,
+    _place_colony_symmetric,
+    _place_colony_roofline,
     _try_place_on_wall,
     _score_rows,
     _parse_colony_size,
@@ -37,6 +39,25 @@ from multispecies_facades_planner_AI.data_training_model1_test import (
 # ─────────────────────────────────────────────────────────────────
 
 SECTOR_FAR_ENOUGH_FRACTION = 0.20
+
+
+
+
+def _place_colony_by_layout(layout: str, neighbour_pts: list | None = None, **kwargs):
+    """
+    Same placers the single-species planner uses, chosen by the species' layout.
+
+    `neighbour_pts` is left empty on a shared wall on purpose: a roofline row
+    that ran on into the adjacent sector would walk straight into the sector
+    the other species has been given.
+    """
+    if layout == "roofline":
+        return _place_colony_roofline(neighbour_pts=neighbour_pts, **kwargs)
+    if layout in ("symmetric", "per_facade"):
+        return _place_colony_symmetric(**kwargs)
+    return _place_colony_in_sector(**kwargs)
+
+
 
 
 def _dist_uv(a, b) -> float:
@@ -344,6 +365,8 @@ def _place_pair_on_shared_wall(
     colony_min2: int, colony_max2: int, dmin2: float, dmax2: float,
     dmin_inter: float,
     building_zero_z: float,
+    layout1: str = "irregular",
+    layout2: str = "irregular",
 ) -> Optional[Tuple[dict, dict]]:
     pair = _select_sector_pair_on_shared_wall(
         building_dict, wall_id, needs1, needs2, model, model_type, xgb_encoders,
@@ -356,7 +379,8 @@ def _place_pair_on_shared_wall(
     (sr1, sc1, pts1, score1), (sr2, sc2, pts2, score2) = pair
     wall = building_dict[wall_id]
 
-    placement1 = _place_colony_in_sector(
+    placement1 = _place_colony_by_layout(
+        layout1,
         feasible_pts=pts1, wall_id=wall_id, wall=wall,
         sector_row=sr1, sector_col=sc1, wall_ground_z=building_zero_z,
         needs=needs1, model=model,
@@ -374,7 +398,8 @@ def _place_pair_on_shared_wall(
     if len(pts2_filtered) < colony_min2:
         pts2_filtered = pts2
 
-    placement2 = _place_colony_in_sector(
+    placement2 = _place_colony_by_layout(
+        layout2,
         feasible_pts=pts2_filtered, wall_id=wall_id, wall=wall,
         sector_row=sr2, sector_col=sc2, wall_ground_z=building_zero_z,
         needs=needs2, model=model,
@@ -408,6 +433,7 @@ def _place_one_species_avoiding_other(
     avoid_uv_list: list, dmin_inter: float,
     building_zero_z: float,
     species_name: str,
+    layout: str = "irregular",
 ) -> Optional[dict]:
     # Used when a wall is already occupied by the other species (from an
     # earlier round of independent assignment) — places this species on the
@@ -450,7 +476,8 @@ def _place_one_species_avoiding_other(
 
     for idx in order:
         sr, sc, pts = feasible_sectors[idx]
-        placement = _place_colony_in_sector(
+        placement = _place_colony_by_layout(
+            layout,
             feasible_pts=pts, wall_id=wall_id, wall=wall, sector_row=sr, sector_col=sc,
             wall_ground_z=building_zero_z, needs=needs, model=model,
             colony_size_min=colony_min, colony_size_max=colony_max,
@@ -492,6 +519,8 @@ def plan_species_combination(
     needs2: dict,
     model_type: str = "lgbm",
     xgb_encoders: dict | None = None,
+    layout1: str = "irregular",
+    layout2: str = "irregular",
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Plans nest placements for two species on the same building at once.
@@ -515,6 +544,15 @@ def plan_species_combination(
 
     colony_min1, colony_max1 = _parse_colony_size(needs1)
     colony_min2, colony_max2 = _parse_colony_size(needs2)
+
+    # a species planned facade by facade (the bats) takes two boxes on every
+    # wall it can use, whatever colony range the sheet gives
+    per_facade1 = layout1 == "per_facade"
+    per_facade2 = layout2 == "per_facade"
+    if per_facade1:
+        colony_min1 = colony_max1 = 2
+    if per_facade2:
+        colony_min2 = colony_max2 = 2
     height_min1, height_max1 = _parse_height_range(needs1)
     height_min2, height_max2 = _parse_height_range(needs2)
     dmin1, dmax1 = _parse_spacing(needs1)
@@ -534,8 +572,10 @@ def plan_species_combination(
     if not walls1 or not walls2:
         raise ValueError("Planning failed: no viable walls found for one or both species.")
 
-    target_walls1 = _resolve_target_walls(_parse_num_orientations(needs1), len(walls1))
-    target_walls2 = _resolve_target_walls(_parse_num_orientations(needs2), len(walls2))
+    target_walls1 = (len(walls1) if per_facade1
+                     else _resolve_target_walls(_parse_num_orientations(needs1), len(walls1)))
+    target_walls2 = (len(walls2) if per_facade2
+                     else _resolve_target_walls(_parse_num_orientations(needs2), len(walls2)))
 
     results1: List[dict] = []
     results2: List[dict] = []
@@ -575,6 +615,7 @@ def plan_species_combination(
                 colony_min1, colony_max1, dmin1, dmax1,
                 colony_min2, colony_max2, dmin2, dmax2,
                 dmin_inter, building_zero_z,
+                layout1=layout1, layout2=layout2,
             )
             idx1 = i1 + 1
             idx2 = i2 + 1
@@ -596,6 +637,7 @@ def plan_species_combination(
                     height_min1, height_max1, colony_min1, colony_max1, dmin1, dmax1,
                     avoid_uv_list=other["uv"], dmin_inter=dmin_inter,
                     building_zero_z=building_zero_z, species_name=species1_name,
+                    layout=layout1,
                 )
                 if placement1 is not None:
                     placement1["shared_wall_with"] = species2_name
@@ -606,7 +648,7 @@ def plan_species_combination(
                     height_min=height_min1, height_max=height_max1, building_zero_z=building_zero_z,
                     colony_min=colony_min1, colony_max=colony_max1, dmin_m=dmin1, dmax_m=dmax1,
                     model_type=model_type, xgb_encoders=xgb_encoders, species_name=species1_name,
-                    sector_rank=0,
+                    sector_rank=0, layout=layout1,
                 )
                 if placement1 is not None:
                     placement1 = _merge_solitary_boxes(placement1)
@@ -624,6 +666,7 @@ def plan_species_combination(
                     height_min2, height_max2, colony_min2, colony_max2, dmin2, dmax2,
                     avoid_uv_list=other["uv"], dmin_inter=dmin_inter,
                     building_zero_z=building_zero_z, species_name=species2_name,
+                    layout=layout2,
                 )
                 if placement2 is not None:
                     placement2["shared_wall_with"] = species1_name
@@ -634,7 +677,7 @@ def plan_species_combination(
                     height_min=height_min2, height_max=height_max2, building_zero_z=building_zero_z,
                     colony_min=colony_min2, colony_max=colony_max2, dmin_m=dmin2, dmax_m=dmax2,
                     model_type=model_type, xgb_encoders=xgb_encoders, species_name=species2_name,
-                    sector_rank=0,
+                    sector_rank=0, layout=layout2,
                 )
                 if placement2 is not None:
                     placement2 = _merge_solitary_boxes(placement2)

@@ -667,6 +667,330 @@ def _place_colony_in_sector(
     }
  
  
+def _place_colony_symmetric(
+    feasible_pts: list,
+    wall_id: str,
+    wall: dict,
+    sector_row: str,
+    sector_col: str,
+    wall_ground_z: float,
+    needs: dict,
+    model,
+    colony_size_min: int,
+    colony_size_max: int,
+    dmin_m: float,
+    dmax_m: float,
+    model_type: str = "lgbm",
+    xgb_encoders: dict | None = None,
+    exclude_point_ids: set | None = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Regular-grid alternative to _place_colony_in_sector ("symmetrical placement").
+
+    The model chooses the anchor: its highest-scoring feasible point. The
+    orientation follows the model's second choice - whichever axis separates the
+    anchor from the next-best point at an admissible distance becomes the long
+    axis of the colony, so rows run horizontally or vertically as the scores
+    suggest rather than by a fixed rule. Spacing is not fixed either: every
+    spacing the species permits is laid out on the wall grid and the arrangement
+    the model scores highest is kept. The anchor is a corner of the grid and the
+    pattern grows away from it, both directions being tried; a partly filled last
+    row is left open at the far end. If no regular layout fits, the colony is
+    reduced by one nest and the search repeats.
+    """
+    if not feasible_pts:
+        return None
+
+    uv = np.array([p[1] for p in feasible_pts], dtype=float)
+    rows = [
+        _build_point_feature_row(
+            pid=pid, uv=pt_uv, xyz=xyz,
+            wall_id=wall_id, wall=wall,
+            sector_row=sector_row, sector_col=sector_col,
+            wall_ground_z=wall_ground_z,
+            needs=needs,
+        )
+        for pid, pt_uv, xyz in feasible_pts
+    ]
+    scores = np.asarray(
+        _score_rows(pd.DataFrame(rows), model, model_type=model_type, xgb_encoders=xgb_encoders),
+        dtype=float,
+    )
+
+    anchor = int(np.argmax(scores))
+    dist_to_anchor = np.hypot(uv[:, 0] - uv[anchor, 0], uv[:, 1] - uv[anchor, 1])
+    admissible = (dist_to_anchor >= dmin_m) & (dist_to_anchor <= dmax_m)
+    if not admissible.any():
+        return None
+    second = int(np.argmax(np.where(admissible, scores, -np.inf)))
+    du = abs(uv[second, 0] - uv[anchor, 0])
+    dv = abs(uv[second, 1] - uv[anchor, 1])
+    long_axis, short_axis = (0, 1) if du >= dv else (1, 0)
+
+    def _pitch(values):
+        uniq = np.unique(np.round(values, 3))
+        diffs = np.diff(uniq)
+        diffs = diffs[diffs > 1e-6]
+        return float(diffs.min()) if len(diffs) else 0.3
+
+    pitch = min(_pitch(uv[:, 0]), _pitch(uv[:, 1]))
+    tol = 0.51 * pitch
+    upper = dmax_m if dmax_m < 1e6 else max(dmin_m * 4.0, dmin_m + 4 * pitch)
+    steps = [k * pitch for k in range(1, int(upper / pitch) + 2)
+             if dmin_m - 1e-9 <= k * pitch <= upper + 1e-9]
+    if not steps:
+        steps = [max(dmin_m, pitch)]
+
+    def _snap(target):
+        d = np.hypot(uv[:, 0] - target[0], uv[:, 1] - target[1])
+        j = int(np.argmin(d))
+        return j, float(d[j])
+
+    best = None
+    for n in range(int(colony_size_max), int(colony_size_min) - 1, -1):
+        if n <= 0:
+            break
+        for n_rows in (1, 2, 3):
+            if n_rows > n:
+                continue
+            n_cols = math.ceil(n / n_rows)
+            for s_long in steps:
+                for s_short in (steps if n_rows > 1 else [0.0]):
+                    for dir_long in (1, -1):
+                        for dir_short in (1, -1):
+                            idx, ok = [], True
+                            for i in range(n_rows):
+                                for j in range(n_cols):
+                                    if len(idx) >= n:
+                                        break
+                                    target = uv[anchor].copy()
+                                    target[long_axis] += dir_long * j * s_long
+                                    target[short_axis] += dir_short * i * s_short
+                                    k, gap = _snap(target)
+                                    if gap > tol or k in idx:
+                                        ok = False
+                                        break
+                                    idx.append(k)
+                                if not ok:
+                                    break
+                            if not ok or len(idx) < n:
+                                continue
+                            sel = uv[idx]
+                            pair = np.hypot(sel[:, None, 0] - sel[None, :, 0],
+                                            sel[:, None, 1] - sel[None, :, 1])
+                            np.fill_diagonal(pair, np.inf)
+                            if pair.min() < dmin_m - 1e-6:
+                                continue
+                            ids = {feasible_pts[k][0] for k in idx}
+                            if exclude_point_ids and ids == set(exclude_point_ids):
+                                continue
+                            score = float(scores[idx].mean())
+                            if best is None or score > best[0]:
+                                best = (score, list(idx))
+        if best is not None:
+            break                      # keep the largest colony that admits a regular layout
+
+    if best is None:
+        return None
+    idx = best[1]
+    return {
+        "selected_point_ids": [feasible_pts[k][0] for k in idx],
+        "xyz": [feasible_pts[k][2] for k in idx],
+        "uv": [feasible_pts[k][1] for k in idx],
+        "colony_size": len(idx),
+        "colony_size_min": colony_size_min,
+        "colony_size_max": colony_size_max,
+    }
+
+
+def _place_colony_roofline(
+    feasible_pts: list,
+    wall_id: str,
+    wall: dict,
+    sector_row: str,
+    sector_col: str,
+    wall_ground_z: float,
+    needs: dict,
+    model,
+    colony_size_min: int,
+    colony_size_max: int,
+    dmin_m: float,
+    dmax_m: float,
+    model_type: str = "lgbm",
+    xgb_encoders: dict | None = None,
+    exclude_point_ids: set | None = None,
+    neighbour_pts: list | None = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Placement directly beneath the roofline, for swift and house martin.
+
+    Expert consultation with the LBV (Landesbund fuer Vogel- und Naturschutz)
+    established that both species need their boxes immediately under the roof,
+    in a horizontal line. The model still chooses the wall and the sector;
+    inside the sector this placer takes the highest row of feasible points and
+    fills it at one constant spacing. When the best sector is full the same row
+    runs on into the horizontally adjacent sector (`neighbour_pts`), and only
+    if the two together cannot carry the colony does a second row open directly
+    below the first, on the same vertical. There is never a third row - a
+    colony that does not fit in two is placed one nest smaller instead.
+
+    A row is a group of feasible points at equal height: a wall plane is
+    vertical, so constant height is a horizontal line on the facade. A position
+    the wall cannot take - a window, the offset band around it - is skipped
+    rather than ending the row, so the line keeps its rhythm across the opening.
+    """
+    if not feasible_pts:
+        return None
+
+    pts = list(feasible_pts) + list(neighbour_pts or [])
+    n_primary = len(feasible_pts)
+    uv = np.array([p[1] for p in pts], dtype=float)
+    z = np.array([p[2][2] for p in pts], dtype=float)
+
+    rows = [
+        _build_point_feature_row(
+            pid=pid, uv=pt_uv, xyz=xyz,
+            wall_id=wall_id, wall=wall,
+            sector_row=sector_row, sector_col=sector_col,
+            wall_ground_z=wall_ground_z,
+            needs=needs,
+        )
+        for pid, pt_uv, xyz in pts
+    ]
+    scores = np.asarray(
+        _score_rows(pd.DataFrame(rows), model, model_type=model_type, xgb_encoders=xgb_encoders),
+        dtype=float,
+    )
+
+    def _pitch(values):
+        uniq = np.unique(np.round(values, 3))
+        diffs = np.diff(uniq)
+        diffs = diffs[diffs > 1e-6]
+        return float(diffs.min()) if len(diffs) else 0.3
+
+    pitch_u, pitch_v = _pitch(uv[:, 0]), _pitch(uv[:, 1])
+    tol_u, tol_v = 0.51 * pitch_u, 0.51 * pitch_v
+
+    def _steps(pitch):
+        upper = dmax_m if dmax_m < 1e6 else max(dmin_m * 4.0, dmin_m + 4 * pitch)
+        s = [k * pitch for k in range(1, int(upper / pitch) + 2)
+             if dmin_m - 1e-9 <= k * pitch <= upper + 1e-9]
+        return s or [max(dmin_m, pitch)]
+
+    steps_u, steps_v = _steps(pitch_u), _steps(pitch_v)
+
+    by_row: Dict[int, list] = {}
+    for i in range(len(pts)):
+        by_row.setdefault(int(round(z[i] / max(pitch_v, 1e-6))), []).append(i)
+    row_z = {k: float(np.mean(z[m])) for k, m in by_row.items()}
+    # highest first, and only rows the best sector itself reaches: the colony
+    # may run on sideways, but it may not start in a neighbouring sector
+    row_keys = sorted(
+        (k for k, m in by_row.items() if any(i < n_primary for i in m)),
+        key=lambda k: -row_z[k],
+    )
+
+    def _members_at(target_z: float, skip: set):
+        hit, best_d = None, None
+        for k, zm in row_z.items():
+            if k in skip:
+                continue
+            d = abs(zm - target_z)
+            if d <= tol_v and (best_d is None or d < best_d):
+                hit, best_d = k, d
+        return (by_row[hit], hit) if hit is not None else None
+
+    def _line(members, u0: float, step: float, direction: int, limit: int) -> list:
+        """
+        Points of one row on the lattice u0, u0 +- step, u0 +- 2*step, ... A
+        position with no feasible point under it (a window) is passed over, so
+        the line continues beyond the opening at the same spacing instead of
+        ending there.
+        """
+        if not members or limit <= 0:
+            return []
+        us = [uv[i, 0] for i in members]
+        slots = int((max(us) - min(us)) / step) + 2
+        out = []
+        for k in range(slots):
+            target = u0 + direction * k * step
+            j, gap = None, None
+            for i in members:
+                d = abs(uv[i, 0] - target)
+                if gap is None or d < gap:
+                    j, gap = i, d
+            if j is not None and gap <= tol_u and j not in out:
+                out.append(j)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _skipped(seq, step: float) -> int:
+        """Lattice positions the row had to pass over."""
+        if len(seq) < 2:
+            return 0
+        us = [uv[i, 0] for i in seq]
+        return max(0, int(round((max(us) - min(us)) / step)) + 1 - len(seq))
+
+    best = None
+    for n in range(int(colony_size_max), max(int(colony_size_min), 1) - 1, -1):
+        for rk in row_keys:
+            members = by_row[rk]
+            anchors = [i for i in members if i < n_primary]
+            found = []
+            for s_u in steps_u:
+                for a in anchors:
+                    for dir_u in (1, -1):
+                        line = _line(members, uv[a, 0], s_u, dir_u, n)
+                        if len(line) >= n:
+                            found.append((line[:n], 1, _skipped(line[:n], s_u)))
+                            continue
+                        if not line:
+                            continue
+                        # the best sector and its neighbour are full: open the
+                        # second - and last - row, directly below this one
+                        for s_v in steps_v:
+                            got = _members_at(row_z[rk] - s_v, skip={rk})
+                            if got is None:
+                                continue
+                            lower, _ = got
+                            rest = n - len(line)
+                            nxt = _line(lower, uv[a, 0], s_u, dir_u, rest)
+                            if len(nxt) >= rest:
+                                found.append((line + nxt[:rest], 2,
+                                              _skipped(line, s_u) + _skipped(nxt[:rest], s_u)))
+                                break
+            for sel, n_rows, skips in found:
+                ids = {pts[i][0] for i in sel}
+                if exclude_point_ids and ids == set(exclude_point_ids):
+                    continue
+                # the LBV rule in order: one row beats two; the best sector is
+                # filled before the neighbour is touched; an unbroken line beats
+                # one that steps over a window; the model's score decides the rest
+                key = (n_rows,
+                       sum(1 for i in sel if i >= n_primary),
+                       skips,
+                       -float(scores[sel].mean()))
+                if best is None or key < best[0]:
+                    best = (key, sel)
+            if best is not None:
+                break                  # highest row that works wins
+        if best is not None:
+            break                      # largest colony that fits wins
+
+    if best is None:
+        return None
+    sel = sorted(best[1], key=lambda i: (-z[i], uv[i, 0]))
+    return {
+        "selected_point_ids": [pts[i][0] for i in sel],
+        "xyz": [pts[i][2] for i in sel],
+        "uv": [pts[i][1] for i in sel],
+        "colony_size": len(sel),
+        "colony_size_min": colony_size_min,
+        "colony_size_max": colony_size_max,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────
 # FEATURE ENGINEERING + SCORING  (shared by all three passes)
 # ─────────────────────────────────────────────────────────────────
@@ -1100,6 +1424,7 @@ def _try_place_on_wall(
     species_name: str = "",
     sector_rank: int = 0,
     exclude_point_ids: set | None = None,
+    layout: str = "irregular",
 ) -> Optional[Dict[str, Any]]:
     # Attempts placement on a specific wall at a given sector rank (0=best, 1=second best).
     # Returns a placement dict or None.
@@ -1154,7 +1479,8 @@ def _try_place_on_wall(
     actual_colony_min = colony_min
     if sector_rank >= len(df_sectors):
         sector_rank = 0
-        actual_colony_min = max(1, colony_min - 1)  # Option 2 tolerance
+        actual_colony_min = (colony_min if layout == "per_facade"
+                             else max(1, colony_min - 1))  # Option 2 tolerance
  
     # try sectors starting from sector_rank
     # for sector_rank > 0 (Option 2): try higher ranks first, then fall back to rank 0
@@ -1170,7 +1496,33 @@ def _try_place_on_wall(
         sec_row, sec_col, pts = feasible_sectors[idx]
         sec_score = float(row_data["_score"])
  
-        placement = _place_colony_in_sector(
+        extra = {}
+        if layout == "roofline":
+            placer = _place_colony_roofline
+            # only the sectors beside this one: the line has to stay horizontal,
+            # so the row above or below is no help to it
+            extra["neighbour_pts"] = [
+                p
+                for nb_row, nb_col in _adjacent_sectors(sec_row, sec_col)
+                if nb_row == sec_row
+                for p in _get_sector_feasible_points(
+                    building_dict=building_dict,
+                    wall_id=wall_id,
+                    sector_row=nb_row,
+                    sector_col=nb_col,
+                    min_height_m=height_min,
+                    max_height_m=height_max,
+                    usable_geom=usable_geom,
+                    needs=needs,
+                )
+            ]
+        elif layout in ("symmetric", "per_facade"):
+            # per_facade: two boxes, so the regular-grid placer lines them up
+            # on one axis - side by side or one above the other
+            placer = _place_colony_symmetric
+        else:
+            placer = _place_colony_in_sector
+        placement = placer(
             feasible_pts=pts,
             wall_id=wall_id,
             wall=wall_obj,
@@ -1186,6 +1538,7 @@ def _try_place_on_wall(
             model_type=model_type,
             xgb_encoders=xgb_encoders,
             exclude_point_ids=exclude_point_ids,
+            **extra,
         )
  
         if placement is not None:
@@ -1270,6 +1623,7 @@ def plan(
     n_options: int = 3,
     model_type: str = "lgbm",
     xgb_encoders: dict | None = None,
+    layout: str = "irregular",
 ) -> List[Dict[str, Any]]:
     """
     AI-supported hierarchical planner. Returns up to n_options placement proposals,
@@ -1326,6 +1680,13 @@ def plan(
     colony_min, colony_max = _parse_colony_size(needs)
     height_min, height_max = _parse_height_range(needs)
     dmin_m,     dmax_m     = _parse_spacing(needs)
+
+    # Bats are planned facade by facade: two boxes on every wall the hard
+    # constraints allow, at the spacing the species sheet gives, rather than one
+    # colony concentrated on the best few walls.
+    per_facade = layout == "per_facade"
+    if per_facade:
+        colony_min = colony_max = 2
  
     # compute building zero: lowest Z across all walls
     all_zs = []
@@ -1376,6 +1737,9 @@ def plan(
     # be offered on the SECOND-best wall instead.
     solitary = _species_fields(needs).get("colonial") == 0
     walls_wanted = target_walls + 1 if (solitary and target_walls == 1) else target_walls
+    if per_facade:
+        walls_wanted = len(ranked_wall_ids)
+        print(f"  Per-facade mode: 2 boxes on each of up to {walls_wanted} walls")
 
     # collect the top ranked walls that can actually produce a placement
     viable_walls: List[str] = []
@@ -1410,7 +1774,10 @@ def plan(
     #   otherwise                     -> both options span the same target walls,
     #                                    Option 1 = best sector, Option 2 = second
     #                                    best sector (with fallback)
-    if solitary and target_walls == 1 and len(viable_walls) >= 2:
+    if per_facade:
+        option_specs = [(viable_walls, 0), (viable_walls, 1)]
+        rerank_by_score = False          # wall ranking already fixes the order
+    elif solitary and target_walls == 1 and len(viable_walls) >= 2:
         option_specs = [([viable_walls[0]], 0), ([viable_walls[1]], 0)]
         rerank_by_score = False          # wall ranking already fixes the order
     else:
@@ -1442,6 +1809,7 @@ def plan(
                 species_name=species_name,
                 sector_rank=sector_rank,
                 exclude_point_ids=opt1_ids_by_wall.get(wid),
+                layout=layout,
             )
             if result is not None:
                 # merge solitary_boxes back into placement if present
