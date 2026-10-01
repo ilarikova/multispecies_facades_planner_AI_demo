@@ -767,18 +767,25 @@ def add_wall_floor_function_labels(
 
 
 @st.cache_resource
-def build_base_figure(walls_data: dict) -> go.Figure:
+def build_base_figure(_walls_data: dict, building_key: str) -> go.Figure:
+    walls_data = _walls_data
     # copy first: the geometry figure is cached and shared with the climate
     # view, which labels itself its own way
-    fig = go.Figure(_build_building_geometry(walls_data))
+    fig = go.Figure(_build_building_geometry(walls_data, building_key))
     add_wall_floor_function_labels(fig, walls_data, offset_xy_m=1.5, z_lift_m=0.2)
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), scene=dict(aspectmode="data"))
     return fig
 
 
 @st.cache_resource
-def _build_building_geometry(walls_data: dict) -> go.Figure:
-    """Walls, windows and doors only — no labels, so each view can label its own way."""
+def _build_building_geometry(_walls_data: dict, building_key: str) -> go.Figure:
+    """
+    Walls, windows and doors only — no labels, so each view can label its own way.
+
+    `_walls_data` is underscored so Streamlit does not hash it for the cache
+    key; `building_key` identifies the building instead.
+    """
+    walls_data = _walls_data
     fig = go.Figure()
     roofs, wall_meshes, openings = [], [], []
     wall_parts = []
@@ -849,7 +856,7 @@ MAIN_VIEW_CENTER_Z = -0.35
 
 
 @st.cache_resource
-def build_climate_figure(walls_data: dict) -> go.Figure:
+def build_climate_figure(_walls_data: dict, building_key: str) -> go.Figure:
     """
     The same building as the main view, with each wall's 3x3 climate sectors
     shaded by their stored median - the PDF's 'building climate overview'.
@@ -859,7 +866,8 @@ def build_climate_figure(walls_data: dict) -> go.Figure:
     labels' geometry, so the shading lands exactly where the stored medians
     were measured, and irregular wall outlines clip themselves.
     """
-    fig = go.Figure(_build_building_geometry(walls_data))
+    walls_data = _walls_data
+    fig = go.Figure(_build_building_geometry(walls_data, building_key))
     # very small labels, sitting lower — this view is a quarter the width of the
     # main one, so the default label block dominates it otherwise
     add_wall_floor_function_labels(
@@ -1006,7 +1014,7 @@ species_list = species_choices()
 
 mode = st.sidebar.radio("Planning mode", ["Single species", "Two species (combination)"])
 
-base_fig = build_base_figure(walls_data)
+base_fig = build_base_figure(walls_data, building["file"])
 fig = go.Figure(base_fig)
 
 # main placement view on the left, climate reference on the right. Both are
@@ -1021,7 +1029,7 @@ with view_col:
 # instead of waiting for options to be generated
 with climate_col:
     st.markdown("#### Incident radiation")
-    climate_fig = go.Figure(build_climate_figure(walls_data))
+    climate_fig = go.Figure(build_climate_figure(walls_data, building["file"]))
     climate_fig.update_layout(
         height=CLIMATE_VIEW_HEIGHT_PX,
         showlegend=False,
