@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
 
-from shapely.geometry import Point, box
+from shapely.geometry import Point, Polygon, box
 from shapely.ops import triangulate, unary_union
 
 from multispecies_facades_planner_AI import facade_planner_functions as fpf
@@ -175,11 +175,168 @@ def triangulate_faces(faces):
     return I, J, K
 
 
-def add_mesh(fig, mesh, name, opacity=0.15, color=None):
-    V = np.asarray(mesh["vertices"], dtype=float)
+# Coordinates are rounded to the millimetre before they go into a figure.
+# Plotly serialises floats in full double precision, which doubles the size of
+# every payload the browser has to download for no visible difference.
+COORD_DECIMALS = 3
+
+
+def merge_meshes(meshes):
+    """
+    One set of vertex and face arrays from many meshes.
+
+    A building exports as hundreds of separate little meshes - every window and
+    door its own. Drawn as hundreds of Mesh3d traces they cost the browser far
+    more than the geometry itself does, so everything sharing a colour is
+    concatenated into a single trace.
+    """
+    X, I, J, K = [], [], [], []
+    offset = 0
+    for mesh in meshes:
+        V = np.round(np.asarray(mesh["vertices"], dtype=float), COORD_DECIMALS)
+        if V.size == 0:
+            continue
+        if "_tri" not in mesh:
+            mesh["_tri"] = triangulate_faces(mesh["faces"])
+        i, j, k = mesh["_tri"]
+        X.append(V)
+        I.extend(a + offset for a in i)
+        J.extend(a + offset for a in j)
+        K.extend(a + offset for a in k)
+        offset += len(V)
+    if not X:
+        return None
+    return (np.vstack(X),
+            np.asarray(I, dtype=np.int32),
+            np.asarray(J, dtype=np.int32),
+            np.asarray(K, dtype=np.int32))
+
+
+def merge_triangles(parts):
+    """Concatenate (vertices, faces) pairs into one, renumbering the faces."""
+    verts: list = []
+    faces: list = []
+    for V, F in parts:
+        base = len(verts)
+        verts.extend(V.tolist())
+        faces.extend((np.asarray(F, dtype=np.int64) + base).tolist())
+    if not faces:
+        return None
+    return (np.asarray(verts, dtype=float),
+            np.asarray(faces, dtype=np.int32))
+
+
+def add_triangles(fig, parts, name, opacity=0.15, color=None):
+    merged = merge_triangles(parts)
+    if merged is None:
+        return
+    V, F = merged
+    fig.add_trace(
+        go.Mesh3d(
+            x=V[:, 0], y=V[:, 1], z=V[:, 2],
+            i=F[:, 0], j=F[:, 1], k=F[:, 2],
+            name=name,
+            opacity=opacity,
+            color=color,
+            showscale=False,
+            hoverinfo="skip",
+        )
+    )
+
+
+def mesh_outline_uv(wall: dict, snap_m: float = 1e-3):
+    """
+    The outline of a flat wall's mesh, in the wall's UV frame.
+
+    A wall is exported as a dense tessellation — thousands of triangles for a
+    flat surface. Its silhouette is the set of edges that belong to a single
+    triangle, which recovers the true shape (notches, sloped tops and all) in
+    one pass and replaces those thousands of triangles with a few. Vertices are
+    snapped to the millimetre first, because the same corner is repeated under
+    several indices in the export and the edges would otherwise not meet.
+
+    Returns a shapely polygon, or None if the mesh does not resolve to one ring.
+    """
+    mesh = wall.get("mesh") or {}
+    plane = wall.get("plane")
+    V = mesh.get("vertices")
+    if not V or not plane:
+        return None
+
+    o = np.asarray(plane["origin"], dtype=float)
+    ux = np.asarray(plane["xaxis"], dtype=float)
+    uy = np.asarray(plane["yaxis"], dtype=float)
+    ux = ux / (np.linalg.norm(ux) + 1e-12)
+    uy = uy / (np.linalg.norm(uy) + 1e-12)
+    rel = np.asarray(V, dtype=float) - o
+    uv = np.round(np.stack([rel @ ux, rel @ uy], axis=1) / snap_m).astype(np.int64)
+
+    keys = {}
+    remap = np.empty(len(uv), dtype=np.int64)
+    points = []
+    for n, key in enumerate(map(tuple, uv)):
+        at = keys.get(key)
+        if at is None:
+            at = keys[key] = len(points)
+            points.append((key[0] * snap_m, key[1] * snap_m))
+        remap[n] = at
+
     if "_tri" not in mesh:
         mesh["_tri"] = triangulate_faces(mesh["faces"])
-    I, J, K = mesh["_tri"]
+    counts = {}
+    for a, b, c in zip(*mesh["_tri"]):
+        i, j, k = int(remap[a]), int(remap[b]), int(remap[c])
+        if i == j or j == k or k == i:
+            continue
+        for e in ((i, j), (j, k), (k, i)):
+            key = (min(e), max(e))
+            counts[key] = counts.get(key, 0) + 1
+
+    neighbours = {}
+    for (i, j), n in counts.items():
+        if n != 1:                       # interior edge, shared by two triangles
+            continue
+        neighbours.setdefault(i, []).append(j)
+        neighbours.setdefault(j, []).append(i)
+    if not neighbours or any(len(v) != 2 for v in neighbours.values()):
+        return None                      # branching outline: not a simple ring
+
+    start = next(iter(neighbours))
+    ring = [start]
+    prev, cur = None, start
+    while True:
+        a, b = neighbours[cur]
+        nxt = a if a != prev else b
+        if nxt == start:
+            break
+        ring.append(nxt)
+        prev, cur = cur, nxt
+        if len(ring) > len(neighbours):
+            return None
+    if len(ring) != len(neighbours) or len(ring) < 3:
+        return None                      # more than one ring (a hole): leave it
+
+    poly = Polygon([points[i] for i in ring]).simplify(snap_m)
+    return poly if poly.is_valid and not poly.is_empty else None
+
+
+def wall_outline_geom(wall: dict):
+    """The wall's drawable outline: from its mesh, else the stored boundary."""
+    poly = mesh_outline_uv(wall)
+    if poly is not None:
+        return poly
+    bd = wall.get("boundary_uv") or []
+    if len(bd) < 3:
+        return None
+    poly = Polygon([(float(p[0]), float(p[1])) for p in bd])
+    return poly if poly.is_valid and not poly.is_empty else None
+
+
+def add_merged_meshes(fig, meshes, name, opacity=0.15, color=None):
+    merged = merge_meshes(meshes)
+    if merged is None:
+        return
+    V, I, J, K = merged
     fig.add_trace(
         go.Mesh3d(
             x=V[:, 0],
@@ -192,6 +349,7 @@ def add_mesh(fig, mesh, name, opacity=0.15, color=None):
             opacity=opacity,
             color=color,
             showscale=False,
+            hoverinfo="skip",
         )
     )
 
@@ -222,24 +380,34 @@ def nice_species_label(stem: str) -> str:
     return s[:1].upper() + s[1:] if s else stem
 
 
-def add_circle_on_plane(fig, center_xyz, plane: dict, radius_m=0.10, n=48, name="", color=None):
-    c = np.asarray(center_xyz, dtype=float)
+def add_circles_on_plane(fig, centers, plane: dict, radius_m=0.10, n=48, name="", color=None):
+    """All of one placement's nest rings as a single trace, split by None gaps."""
+    if not centers:
+        return
     ux = np.asarray(plane["xaxis"], dtype=float)
     uy = np.asarray(plane["yaxis"], dtype=float)
     ux = ux / (np.linalg.norm(ux) + 1e-12)
     uy = uy / (np.linalg.norm(uy) + 1e-12)
     ts = np.linspace(0, 2 * np.pi, n, endpoint=True)
-    pts = [c + radius_m * np.cos(t) * ux + radius_m * np.sin(t) * uy for t in ts]
-    pts = np.asarray(pts, dtype=float)
+    ring = radius_m * (np.cos(ts)[:, None] * ux + np.sin(ts)[:, None] * uy)
+
+    xs: list = []
+    ys: list = []
+    zs: list = []
+    for c in centers:
+        pts = np.round(np.asarray(c, dtype=float) + ring, COORD_DECIMALS)
+        xs.extend(pts[:, 0].tolist() + [None])
+        ys.extend(pts[:, 1].tolist() + [None])
+        zs.extend(pts[:, 2].tolist() + [None])
+
     fig.add_trace(
         go.Scatter3d(
-            x=pts[:, 0],
-            y=pts[:, 1],
-            z=pts[:, 2],
+            x=xs, y=ys, z=zs,
             mode="lines",
             line=dict(width=4, color=color),
             name=name,
             showlegend=False,
+            hoverinfo="skip",
         )
     )
 
@@ -339,11 +507,59 @@ def placement_area_geom(wall: dict, placement: dict, needs: dict):
     return None if area.is_empty else area
 
 
-def add_placement_area(fig, wall: dict, geom, color: str, label: str, opacity=None):
-    """Fill the placeable area on the wall plane, at half the nest intensity."""
+def ear_clip(coords):
+    """
+    Triangles of a simple polygon ring, as (points, index triples).
+
+    The wall outlines are not all rectangles — gables and setbacks make them
+    concave — and a Delaunay triangulation of their corners would bridge those
+    notches, drawing wall where there is none. Ear clipping only ever cuts
+    triangles that lie inside the ring. The rings here have at most a couple of
+    dozen corners, so the simple quadratic version is more than fast enough.
+    """
+    pts = [(float(c[0]), float(c[1])) for c in coords]
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts.pop()
+    n = len(pts)
+    if n < 3:
+        return pts, []
+
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    order = list(range(n))
+    signed = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                 for i in range(n))
+    if signed < 0:                      # work anticlockwise
+        order.reverse()
+
+    tris = []
+    guard = 0
+    while len(order) > 2 and guard <= n * n:
+        guard += 1
+        for k in range(len(order)):
+            i0, i1, i2 = order[k - 1], order[k], order[(k + 1) % len(order)]
+            a, b, c = pts[i0], pts[i1], pts[i2]
+            if cross(a, b, c) <= 1e-12:         # reflex corner or a sliver
+                continue
+            if any(cross(a, b, pts[m]) >= -1e-12
+                   and cross(b, c, pts[m]) >= -1e-12
+                   and cross(c, a, pts[m]) >= -1e-12
+                   for m in order if m not in (i0, i1, i2)):
+                continue                        # another corner sits in the ear
+            tris.append((i0, i1, i2))
+            order.pop(k)
+            break
+        else:
+            break                               # no ear found: ring is degenerate
+    return pts, tris
+
+
+def placement_area_mesh(wall: dict, geom):
+    """Triangles of a wall-plane area, as (vertices, faces); None if empty."""
     plane = wall.get("plane")
     if plane is None or geom is None or geom.is_empty:
-        return
+        return None
 
     o = np.asarray(plane["origin"], dtype=float)
     ux = np.asarray(plane["xaxis"], dtype=float)
@@ -352,26 +568,43 @@ def add_placement_area(fig, wall: dict, geom, color: str, label: str, opacity=No
     uy = uy / (np.linalg.norm(uy) + 1e-12)
 
     verts, faces = [], []
-    for tri in triangulate(geom):
-        # triangulate() covers the convex hull, so drop anything that falls in a
-        # concavity or a hole cut by the hard constraints
-        if not geom.contains(tri.centroid):
+    parts = geom.geoms if geom.geom_type.startswith("Multi") else [geom]
+    for poly in parts:
+        if poly.is_empty or poly.geom_type != "Polygon":
             continue
+        if poly.interiors:
+            # a ring with holes in it — shapely's Delaunay covers the convex
+            # hull, so triangles over a hole or a concavity are dropped by
+            # testing their centre
+            for tri in triangulate(poly):
+                if not poly.contains(tri.centroid):
+                    continue
+                base = len(verts)
+                for u, v in list(tri.exterior.coords)[:3]:
+                    verts.append(o + float(u) * ux + float(v) * uy)
+                faces.append((base, base + 1, base + 2))
+            continue
+        ring, tris = ear_clip(list(poly.exterior.coords))
         base = len(verts)
-        for u, v in list(tri.exterior.coords)[:3]:
-            verts.append(o + float(u) * ux + float(v) * uy)
-        faces.append((base, base + 1, base + 2))
+        verts.extend(o + float(u) * ux + float(v) * uy for u, v in ring)
+        faces.extend((base + a, base + b, base + c) for a, b, c in tris)
 
     if not faces:
-        return
+        return None
+    return (np.round(np.asarray(verts, dtype=float), COORD_DECIMALS),
+            np.asarray(faces, dtype=np.int32))
 
-    V = np.asarray(verts, dtype=float)
+
+def add_placement_area(fig, wall: dict, geom, color: str, label: str, opacity=None):
+    """Fill the placeable area on the wall plane, at half the nest intensity."""
+    mesh = placement_area_mesh(wall, geom)
+    if mesh is None:
+        return
+    V, faces = mesh
     fig.add_trace(
         go.Mesh3d(
             x=V[:, 0], y=V[:, 1], z=V[:, 2],
-            i=[f[0] for f in faces],
-            j=[f[1] for f in faces],
-            k=[f[2] for f in faces],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
             color=color,
             opacity=PLACEMENT_AREA_OPACITY if opacity is None else opacity,
             flatshading=True,
@@ -447,8 +680,8 @@ def add_placement_points_and_circles(fig, placement: dict, walls_data: dict, col
         )
     )
     if plane:
-        for p in pts:
-            add_circle_on_plane(fig, p, plane, radius_m=radius_m, name=f"circle_{label}", color=color)
+        add_circles_on_plane(fig, pts, plane, radius_m=radius_m,
+                             name=f"circles_{label}", color=color)
 
 
 def add_wall_floor_function_labels(
@@ -472,6 +705,9 @@ def add_wall_floor_function_labels(
     ground_z = float(min(zs)) if zs else 0.0
     label_z = ground_z + float(z_lift_m)
 
+    # collected and emitted as one trace per kind: a text trace per wall is a
+    # per-rerun cost for the browser that buys nothing
+    labels = {"ff": [], "ori": []}
     for wall_id, wall in walls_data.items():
         if not isinstance(wall, dict):
             continue
@@ -507,31 +743,27 @@ def add_wall_floor_function_labels(
         # (x, y) so the two lines read as one label rather than a single \n-joined
         # string (Scatter3d text doesn't render embedded newlines as separate lines).
         half_gap = line_gap_m / 2.0 if (has_ff and has_ori) else 0.0
-        font = dict(size=font_size) if font_size else None
         if has_ff:
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[p[0]], y=[p[1]], z=[p[2] + half_gap],
-                    mode="text",
-                    text=[str(ff)],
-                    textposition="middle center",
-                    textfont=font,
-                    showlegend=False,
-                    name=f"ff_{wall_id}",
-                )
-            )
+            labels["ff"].append((p[0], p[1], p[2] + half_gap, str(ff)))
         if has_ori:
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[p[0]], y=[p[1]], z=[p[2] - half_gap],
-                    mode="text",
-                    text=[str(orientation).upper()],
-                    textposition="middle center",
-                    textfont=font,
-                    showlegend=False,
-                    name=f"ori_{wall_id}",
-                )
+            labels["ori"].append((p[0], p[1], p[2] - half_gap, str(orientation).upper()))
+
+    font = dict(size=font_size) if font_size else None
+    for kind, rows in labels.items():
+        if not rows:
+            continue
+        fig.add_trace(
+            go.Scatter3d(
+                x=[r[0] for r in rows], y=[r[1] for r in rows], z=[r[2] for r in rows],
+                mode="text",
+                text=[r[3] for r in rows],
+                textposition="middle center",
+                textfont=font,
+                showlegend=False,
+                hoverinfo="skip",
+                name=kind,
             )
+        )
 
 
 @st.cache_resource
@@ -548,15 +780,26 @@ def build_base_figure(walls_data: dict) -> go.Figure:
 def _build_building_geometry(walls_data: dict) -> go.Figure:
     """Walls, windows and doors only — no labels, so each view can label its own way."""
     fig = go.Figure()
+    roofs, wall_meshes, openings = [], [], []
+    wall_parts = []
     for wall_id, wall in walls_data.items():
         if not isinstance(wall, dict) or "mesh" not in wall:
             continue
 
         if wall.get("type") == "roof":
-            add_mesh(fig, wall["mesh"], name=wall_id, opacity=1, color="lightgrey")
+            roofs.append(wall["mesh"])
             continue
 
-        add_mesh(fig, wall["mesh"], name=wall_id, opacity=0.3, color="lightblue")
+        # Every wall is flat and the export stores its outline, so the wall is
+        # drawn from that outline — a handful of points — rather than from the
+        # thousands of triangles the exporter tessellated it into. Same surface,
+        # a fraction of the data the browser has to carry on every rerun.
+        outline = wall_outline_geom(wall)
+        part = placement_area_mesh(wall, outline) if outline is not None else None
+        if part is not None:
+            wall_parts.append(part)
+        else:
+            wall_meshes.append(wall["mesh"])
         wins = wall.get("windows") or {}
         doors = wall.get("doors") or {}
         wall_V = np.asarray(wall["mesh"]["vertices"], dtype=float)
@@ -568,20 +811,19 @@ def _build_building_geometry(walls_data: dict) -> go.Figure:
         # (facade_planner_visAI._add_scene) already draws openings this same way.
         # Openings whose mesh still doesn't actually sit on the wall (bad export
         # data, e.g. building0173) are skipped entirely rather than drawn wrong.
-        if isinstance(wins, dict):
-            for win_id, win in wins.items():
-                m = win.get("mesh")
+        for group in (wins, doors):
+            if not isinstance(group, dict):
+                continue
+            for m in (o.get("mesh") for o in group.values()):
                 if m and m.get("vertices") and opening_mesh_fits_wall(
                     wall_vmin, wall_vmax, m["vertices"], OPENING_FIT_TOLERANCE_M
                 ):
-                    add_mesh(fig, m, name=f"{wall_id}:{win_id}", opacity=0.45, color="royalblue")
-        if isinstance(doors, dict):
-            for door_id, door in doors.items():
-                m = door.get("mesh")
-                if m and m.get("vertices") and opening_mesh_fits_wall(
-                    wall_vmin, wall_vmax, m["vertices"], OPENING_FIT_TOLERANCE_M
-                ):
-                    add_mesh(fig, m, name=f"{wall_id}:{door_id}", opacity=0.45, color="royalblue")
+                    openings.append(m)
+
+    add_merged_meshes(fig, roofs, name="roofs", opacity=1, color="lightgrey")
+    add_triangles(fig, wall_parts, name="walls", opacity=0.3, color="lightblue")
+    add_merged_meshes(fig, wall_meshes, name="walls_mesh", opacity=0.3, color="lightblue")
+    add_merged_meshes(fig, openings, name="openings", opacity=0.45, color="royalblue")
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), scene=dict(aspectmode="data"))
     return fig
 
@@ -604,12 +846,6 @@ CAMERA_EYE = 2.5
 # into what is left. More negative = higher in the frame.
 MAIN_VIEW_HEIGHT_PX = 560
 MAIN_VIEW_CENTER_Z = -0.35
-
-
-def _sector_climate_color(t: float) -> str:
-    """t in 0..1 -> colour. Sampled at 1-t so high climate reads red (RdYlBu_r)."""
-    t = 0.0 if t != t else min(1.0, max(0.0, float(t)))
-    return pc.sample_colorscale(CLIMATE_COLORSCALE, [1.0 - t])[0]
 
 
 @st.cache_resource
@@ -645,6 +881,12 @@ def build_climate_figure(walls_data: dict) -> go.Figure:
     if vmax - vmin < 1e-9:
         vmax = vmin + 1.0
 
+    # every sector of every wall ends up in one mesh, each triangle carrying its
+    # own sector colour - 70-280 separate meshes was the slowest thing in the app
+    sector_verts: list = []
+    sector_faces: list = []
+    sector_values: list = []
+
     for wall_id, wall in walls_data.items():
         if not isinstance(wall, dict) or not wall.get("boundary_uv"):
             continue
@@ -662,29 +904,57 @@ def build_climate_figure(walls_data: dict) -> go.Figure:
         du, dv = wall_grid_size(wall)
         hu, hv = du * 0.51, dv * 0.51
         v_up = fpf.v_axis_points_up(wall)
+        outline = wall_outline_geom(wall)
 
-        cells = {}
+        # The sector is the extent of the grid points labelled with it, clipped
+        # to the wall outline — one small rectangle each. Taking the union of
+        # the individual grid cells instead produced tens of thousands of
+        # triangles per building, which was most of this view's weight.
+        spans = {}
         for p in (wall.get("grid") or {}).values():
             uv = p.get("uv")
             if not uv:
                 continue
             u, v = float(uv[0]), float(uv[1])
             row, col = fpf.sector_3x3_labels(u, v, bbox, v_up=v_up)
-            cells.setdefault("%s_%s" % (row, col), []).append(
-                box(u - hu, v - hv, u + hu, v + hv)
-            )
+            s = spans.setdefault("%s_%s" % (row, col), [u, v, u, v])
+            s[0], s[1] = min(s[0], u), min(s[1], v)
+            s[2], s[3] = max(s[2], u), max(s[3], v)
 
-        for key, boxes in cells.items():
+        for key, (u0, v0, u1, v1) in spans.items():
             val = sm.get(key)
             if val is None:
                 continue
-            geom = unary_union(boxes)
-            add_placement_area(
-                fig, wall, geom,
-                _sector_climate_color((float(val) - vmin) / (vmax - vmin)),
-                "climate_%s_%s" % (wall_id, key),
+            rect = box(u0 - hu, v0 - hv, u1 + hu, v1 + hv)
+            geom = rect.intersection(outline) if outline is not None else rect
+            mesh = placement_area_mesh(wall, geom)
+            if mesh is None:
+                continue
+            V, faces = mesh
+            base = len(sector_verts)
+            sector_verts.extend(V.tolist())
+            sector_faces.extend((faces + base).tolist())
+            sector_values.extend([float(val)] * len(faces))
+
+    if sector_faces:
+        V = np.asarray(sector_verts, dtype=float)
+        F = np.asarray(sector_faces, dtype=np.int32)
+        fig.add_trace(
+            go.Mesh3d(
+                x=V[:, 0], y=V[:, 1], z=V[:, 2],
+                i=F[:, 0], j=F[:, 1], k=F[:, 2],
+                intensity=np.asarray(sector_values, dtype=float),
+                intensitymode="cell",
+                colorscale=CLIMATE_COLORSCALE,
+                reversescale=True,          # warm sectors read red, as the PDF does
+                cmin=vmin, cmax=vmax, showscale=False,
                 opacity=CLIMATE_SECTOR_OPACITY,
+                flatshading=True,
+                name="climate_sectors",
+                showlegend=False,
+                hoverinfo="skip",
             )
+        )
 
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0),
                       scene=dict(aspectmode="data"), showlegend=False)
