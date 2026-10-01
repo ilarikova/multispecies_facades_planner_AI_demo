@@ -374,30 +374,48 @@ def building_ground_z(walls_data: dict) -> float:
     return float(min(zs)) if zs else 0.0
 
 
-def local_height_axis(walls_data: dict) -> dict:
-    """
-    z-axis settings that read as height above the building's own base.
+def building_bounds(walls_data: dict):
+    """(min, max) corner of the building, in world coordinates."""
+    V = [v
+         for w in walls_data.values() if isinstance(w, dict)
+         for v in ((w.get("mesh") or {}).get("vertices") or [])]
+    if not V:
+        return None
+    A = np.asarray(V, dtype=float)
+    return A.min(axis=0), A.max(axis=0)
 
-    The exports are in world coordinates — the buildings sit at 367–386 m above
-    sea level — which tells a planner nothing. The geometry keeps those
-    coordinates, since the planner works in them; only the tick labels are
-    rewritten, so a 15 m house reads 0 to 15.
-    """
-    zs = [v[2]
-          for w in walls_data.values() if isinstance(w, dict)
-          for v in ((w.get("mesh") or {}).get("vertices") or [])]
-    if not zs:
-        return dict(title="height (m)")
-    ground, top = float(min(zs)), float(max(zs))
-    span = max(top - ground, 1.0)
-    step = next(s for s in (1.0, 2.0, 5.0, 10.0, 20.0) if span / s <= 6) \
-        if span / 20.0 <= 6 else 50.0
+
+def _local_axis(lo: float, hi: float, title: str) -> dict:
+    """Ticks counting from `lo`, labelled in metres, about five of them."""
+    span = max(hi - lo, 1.0)
+    step = next((s for s in (1.0, 2.0, 5.0, 10.0, 20.0, 50.0) if span / s <= 6), 100.0)
     marks = [k * step for k in range(int(span / step) + 1)]
     return dict(
         tickmode="array",
-        tickvals=[ground + m for m in marks],
+        tickvals=[lo + m for m in marks],
         ticktext=[f"{m:.0f}" for m in marks],
-        title="height (m)",
+        title=title,
+    )
+
+
+def local_axes(walls_data: dict) -> dict:
+    """
+    Scene axes measured from the building's own lowest corner.
+
+    The exports carry city-model coordinates — building 4868 sits at y ≈ −105,
+    z ≈ 367 m above sea level — which says nothing about the building. The
+    geometry keeps those coordinates, since the planner works in them; only the
+    tick labels are rewritten, so a 44 × 38 m, 19 m building reads 0–44, 0–38
+    and 0–19.
+    """
+    bounds = building_bounds(walls_data)
+    if bounds is None:
+        return dict(zaxis=dict(title="height (m)"))
+    lo, hi = bounds
+    return dict(
+        xaxis=_local_axis(lo[0], hi[0], "x (m)"),
+        yaxis=_local_axis(lo[1], hi[1], "y (m)"),
+        zaxis=_local_axis(lo[2], hi[2], "height (m)"),
     )
 
 
@@ -1078,7 +1096,7 @@ with climate_col:
         showlegend=False,
         scene=dict(
             aspectmode="data",
-            zaxis=local_height_axis(walls_data),
+            **local_axes(walls_data),
             # Same camera as the placement view, and no dragmode="orbit": orbit
             # rotates freely about every axis, so the building tumbled and ended
             # up on its side. The default turntable keeps the vertical upright,
@@ -1300,7 +1318,7 @@ fig.update_layout(
     height=MAIN_VIEW_HEIGHT_PX,
     scene=dict(
         aspectmode="data",
-        zaxis=local_height_axis(walls_data),
+        **local_axes(walls_data),
         camera=dict(
             eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6),
             center=dict(x=0, y=0, z=MAIN_VIEW_CENTER_Z),
