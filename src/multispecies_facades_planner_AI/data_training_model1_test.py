@@ -830,6 +830,7 @@ def _place_colony_roofline(
     xgb_encoders: dict | None = None,
     exclude_point_ids: set | None = None,
     neighbour_pts: list | None = None,
+    max_rows: int = 2,
 ) -> Optional[Dict[str, Any]]:
     """
     Placement directly beneath the roofline, for swift and house martin.
@@ -843,6 +844,10 @@ def _place_colony_roofline(
     if the two together cannot carry the colony does a second row open directly
     below the first, on the same vertical. There is never a third row - a
     colony that does not fit in two is placed one nest smaller instead.
+
+    With `max_rows=1` no second row opens at all: the house martin is placed in
+    a single line across the two sectors, and a colony that does not fit in it
+    is placed smaller. The swift keeps the two-row fallback.
 
     A row is a group of feasible points at equal height: a wall plane is
     vertical, so constant height is a horizontal line on the facade. A position
@@ -960,7 +965,7 @@ def _place_colony_roofline(
                         if len(line) >= n:
                             found.append((line[:n], 1, _skipped(line[:n], s_u)))
                             continue
-                        if not line:
+                        if not line or max_rows < 2:
                             continue
                         # the best sector and its neighbour are full: open the
                         # second - and last - row, directly below this one
@@ -1512,8 +1517,10 @@ def _try_place_on_wall(
         sec_score = float(row_data["_score"])
  
         extra = {}
-        if layout == "roofline":
+        if layout in ("roofline", "roofline_single"):
             placer = _place_colony_roofline
+            # the house martin gets one row and no fallback below it
+            extra["max_rows"] = 1 if layout == "roofline_single" else 2
             # only the sectors beside this one: the line has to stay horizontal,
             # so the row above or below is no help to it
             extra["neighbour_pts"] = [

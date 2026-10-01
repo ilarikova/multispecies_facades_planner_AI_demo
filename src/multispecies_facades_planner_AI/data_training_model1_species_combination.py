@@ -51,8 +51,10 @@ def _place_colony_by_layout(layout: str, neighbour_pts: list | None = None, **kw
     that ran on into the adjacent sector would walk straight into the sector
     the other species has been given.
     """
-    if layout == "roofline":
-        return _place_colony_roofline(neighbour_pts=neighbour_pts, **kwargs)
+    if layout in ("roofline", "roofline_single"):
+        return _place_colony_roofline(neighbour_pts=neighbour_pts,
+                                      max_rows=1 if layout == "roofline_single" else 2,
+                                      **kwargs)
     if layout in ("symmetric", "per_facade"):
         return _place_colony_symmetric(**kwargs)
     return _place_colony_in_sector(**kwargs)

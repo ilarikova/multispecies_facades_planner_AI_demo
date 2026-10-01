@@ -68,6 +68,8 @@ ALLOWED_SPECIES_PAIRS = [
     ("house_sparrow", "common_pipistrelle"),
     ("swift", "common_noctule"),
     ("swift", "common_pipistrelle"),
+    ("house_martin", "common_noctule"),
+    ("house_martin", "common_pipistrelle"),
 ]
 
 ORDINAL_WALL_LABELS = ["Best wall", "Second best wall", "Third best wall", "Fourth best wall"]
@@ -130,7 +132,11 @@ SINGLE_SPECIES_ALLOWLIST = set(SPECIES_ORDER)
 #                 constraints allow, at the spacing from the species sheet.
 #   irregular / symmetric — of the rest, only the house sparrow is offered the
 #                 regular-grid alternative to the clustered placement.
-ROOFLINE_SPECIES = {"swift", "house_martin"}
+# Both are placed under the roofline; the house martin takes one row only -
+# best sector, then the adjacent one - while the swift may open a second row
+# below the first when the two sectors cannot carry the colony.
+ROOFLINE_SPECIES = {"swift"}
+ROOFLINE_SINGLE_ROW_SPECIES = {"house_martin"}
 PER_FACADE_SPECIES = {"common_noctule", "common_pipistrelle"}
 STYLE_CHOICE_SPECIES = {"house_sparrow"}
 
@@ -358,6 +364,41 @@ def opening_mesh_fits_wall(wall_vmin: np.ndarray, wall_vmax: np.ndarray, opening
     OV = np.asarray(opening_vertices, dtype=float)
     d = np.maximum(wall_vmin - OV, 0) + np.maximum(OV - wall_vmax, 0)
     return float(np.linalg.norm(d, axis=1).max()) <= tol
+
+
+def building_ground_z(walls_data: dict) -> float:
+    """Lowest point of the building, in world z."""
+    zs = [v[2]
+          for w in walls_data.values() if isinstance(w, dict)
+          for v in ((w.get("mesh") or {}).get("vertices") or [])]
+    return float(min(zs)) if zs else 0.0
+
+
+def local_height_axis(walls_data: dict) -> dict:
+    """
+    z-axis settings that read as height above the building's own base.
+
+    The exports are in world coordinates — the buildings sit at 367–386 m above
+    sea level — which tells a planner nothing. The geometry keeps those
+    coordinates, since the planner works in them; only the tick labels are
+    rewritten, so a 15 m house reads 0 to 15.
+    """
+    zs = [v[2]
+          for w in walls_data.values() if isinstance(w, dict)
+          for v in ((w.get("mesh") or {}).get("vertices") or [])]
+    if not zs:
+        return dict(title="height (m)")
+    ground, top = float(min(zs)), float(max(zs))
+    span = max(top - ground, 1.0)
+    step = next(s for s in (1.0, 2.0, 5.0, 10.0, 20.0) if span / s <= 6) \
+        if span / 20.0 <= 6 else 50.0
+    marks = [k * step for k in range(int(span / step) + 1)]
+    return dict(
+        tickmode="array",
+        tickvals=[ground + m for m in marks],
+        ticktext=[f"{m:.0f}" for m in marks],
+        title="height (m)",
+    )
 
 
 def wall_mesh_normal(wall: dict) -> np.ndarray:
@@ -692,6 +733,7 @@ def add_wall_floor_function_labels(
     z_lift_m: float = 0.2,
     font_size: int | None = None,
     line_gap_m: float = 1.6,
+    kinds: tuple = ("ff", "ori"),
 ):
     # estimate a "ground" z from all wall meshes
     zs = []
@@ -713,8 +755,8 @@ def add_wall_floor_function_labels(
             continue
         ff = wall.get("floor_function")
         orientation = wall.get("orientation")
-        has_ff = bool(ff and str(ff).strip())
-        has_ori = bool(orientation and str(orientation).strip())
+        has_ff = "ff" in kinds and bool(ff and str(ff).strip())
+        has_ori = "ori" in kinds and bool(orientation and str(orientation).strip())
         if not has_ff and not has_ori:
             continue
 
@@ -868,11 +910,12 @@ def build_climate_figure(_walls_data: dict, building_key: str) -> go.Figure:
     """
     walls_data = _walls_data
     fig = go.Figure(_build_building_geometry(walls_data, building_key))
-    # very small labels, sitting lower — this view is a quarter the width of the
-    # main one, so the default label block dominates it otherwise
+    # orientation only, small: this view is a quarter the width of the main one,
+    # and what a reader needs from it is which way a warm wall faces
     add_wall_floor_function_labels(
         fig, walls_data,
-        offset_xy_m=1.5, z_lift_m=-1.2, font_size=2, line_gap_m=0.27,
+        offset_xy_m=1.5, z_lift_m=0.2, font_size=9, line_gap_m=0.0,
+        kinds=("ori",),
     )
 
     # one normalisation across the whole building, as the PDF does
@@ -1035,8 +1078,15 @@ with climate_col:
         showlegend=False,
         scene=dict(
             aspectmode="data",
-            dragmode="orbit",
-            camera=dict(eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6)),
+            zaxis=local_height_axis(walls_data),
+            # Same camera as the placement view, and no dragmode="orbit": orbit
+            # rotates freely about every axis, so the building tumbled and ended
+            # up on its side. The default turntable keeps the vertical upright,
+            # which is how the view beside it behaves.
+            camera=dict(
+                eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6),
+                center=dict(x=0, y=0, z=MAIN_VIEW_CENTER_Z),
+            ),
         ),
     )
     # height must be given to Streamlit too: its own `height` defaults to
@@ -1065,6 +1115,8 @@ def layout_from_label(label: str) -> str:
 def layout_for(species_name: str, style: str) -> str:
     if species_name in ROOFLINE_SPECIES:
         return "roofline"
+    if species_name in ROOFLINE_SINGLE_ROW_SPECIES:
+        return "roofline_single"
     if species_name in PER_FACADE_SPECIES:
         return "per_facade"
     return style if species_name in STYLE_CHOICE_SPECIES else "irregular"
@@ -1248,6 +1300,7 @@ fig.update_layout(
     height=MAIN_VIEW_HEIGHT_PX,
     scene=dict(
         aspectmode="data",
+        zaxis=local_height_axis(walls_data),
         camera=dict(
             eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6),
             center=dict(x=0, y=0, z=MAIN_VIEW_CENTER_Z),
