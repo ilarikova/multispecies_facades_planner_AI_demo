@@ -667,6 +667,11 @@ def _place_colony_in_sector(
     }
  
  
+# Most species allow a spacing range a few grid steps wide; this bounds the
+# search even if a wall's grid turns out finer than expected.
+MAX_SPACING_CANDIDATES = 24
+
+
 def _place_colony_symmetric(
     feasible_pts: list,
     wall_id: str,
@@ -728,16 +733,21 @@ def _place_colony_symmetric(
     long_axis, short_axis = (0, 1) if du >= dv else (1, 0)
 
     def _pitch(values):
+        # The median gap between neighbouring coordinates, not the smallest.
+        # Some exports carry a pair of points a millimetre apart; taking the
+        # smallest gap there made the lattice 1 mm wide, which left thousands of
+        # candidate spacings to try instead of a dozen - minutes of searching on
+        # a wall whose grid is actually 0.3 m.
         uniq = np.unique(np.round(values, 3))
         diffs = np.diff(uniq)
         diffs = diffs[diffs > 1e-6]
-        return float(diffs.min()) if len(diffs) else 0.3
+        return float(np.median(diffs)) if len(diffs) else 0.3
 
     pitch = min(_pitch(uv[:, 0]), _pitch(uv[:, 1]))
     tol = 0.51 * pitch
     upper = dmax_m if dmax_m < 1e6 else max(dmin_m * 4.0, dmin_m + 4 * pitch)
     steps = [k * pitch for k in range(1, int(upper / pitch) + 2)
-             if dmin_m - 1e-9 <= k * pitch <= upper + 1e-9]
+             if dmin_m - 1e-9 <= k * pitch <= upper + 1e-9][:MAX_SPACING_CANDIDATES]
     if not steps:
         steps = [max(dmin_m, pitch)]
 
@@ -863,10 +873,15 @@ def _place_colony_roofline(
     )
 
     def _pitch(values):
+        # The median gap between neighbouring coordinates, not the smallest.
+        # Some exports carry a pair of points a millimetre apart; taking the
+        # smallest gap there made the lattice 1 mm wide, which left thousands of
+        # candidate spacings to try instead of a dozen - minutes of searching on
+        # a wall whose grid is actually 0.3 m.
         uniq = np.unique(np.round(values, 3))
         diffs = np.diff(uniq)
         diffs = diffs[diffs > 1e-6]
-        return float(diffs.min()) if len(diffs) else 0.3
+        return float(np.median(diffs)) if len(diffs) else 0.3
 
     pitch_u, pitch_v = _pitch(uv[:, 0]), _pitch(uv[:, 1])
     tol_u, tol_v = 0.51 * pitch_u, 0.51 * pitch_v
@@ -874,7 +889,7 @@ def _place_colony_roofline(
     def _steps(pitch):
         upper = dmax_m if dmax_m < 1e6 else max(dmin_m * 4.0, dmin_m + 4 * pitch)
         s = [k * pitch for k in range(1, int(upper / pitch) + 2)
-             if dmin_m - 1e-9 <= k * pitch <= upper + 1e-9]
+             if dmin_m - 1e-9 <= k * pitch <= upper + 1e-9][:MAX_SPACING_CANDIDATES]
         return s or [max(dmin_m, pitch)]
 
     steps_u, steps_v = _steps(pitch_u), _steps(pitch_v)
