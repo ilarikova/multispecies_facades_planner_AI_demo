@@ -26,11 +26,13 @@ DATA_DIR = APP_DIR / "demo_data"
 ICONS_DIR = DATA_DIR / "icons"
 
 EXCEL_PATH = DATA_DIR / "bird_species.xlsx"
-# Final model: XGBoost trained on all 239 labelled iterations (5 buildings,
-# 6 species, reduced feature set, 500 trees). Replaces the earlier model that
-# had seen only 4 species. Written by xgboost 3.2.0, matching requirements.txt.
-XGB_RANKER_PATH = DATA_DIR / "models" / "nestworks_xgb_ranker_final.pkl"
-XGB_ENCODERS_PATH = DATA_DIR / "models" / "nestworks_encoders_final.pkl"
+# XGBoost trained on all 239 labelled iterations (5 buildings, 6 species,
+# 500 trees), on the full feature set: 49 named features plus the 16 orientation
+# flags. The planner computes all of them at inference, so nothing is scored on
+# placeholder values. The reduced-feature model it replaces is kept alongside.
+# Written by xgboost 3.2.0, matching requirements.txt.
+XGB_RANKER_PATH = DATA_DIR / "models" / "nestworks_xgb_ranker_full.pkl"
+XGB_ENCODERS_PATH = DATA_DIR / "models" / "nestworks_encoders_full.pkl"
 MODEL_TYPE = "xgb"
 
 COLOR_A = "#F4A623"  # orange — best placement (single mode) / species A (combination mode)
@@ -72,14 +74,25 @@ ALLOWED_SPECIES_PAIRS = [
     ("house_martin", "common_pipistrelle"),
 ]
 
-ORDINAL_WALL_LABELS = ["Best wall", "Second best wall", "Third best wall", "Fourth best wall"]
+def placement_labels(walls_data: dict, placements: list, order: list) -> list:
+    """
+    A heading per placement, naming the facade it sits on.
 
+    The proposals are not presented as a ranking: the tool offers placements
+    that all satisfy the species' requirements, and which of them suits a given
+    building is a decision for the planner and the ecologist. Two placements on
+    equally oriented walls are told apart by the wall number.
+    """
+    def face(p):
+        wall = walls_data.get(p["wall_id"], {}) or {}
+        o = str(wall.get("orientation") or "").strip().upper()
+        return f"{o} facade" if o else "Facade"
 
-def ordinal_wall_label(rank: int) -> str:
-    idx = rank - 1
-    if 0 <= idx < len(ORDINAL_WALL_LABELS):
-        return ORDINAL_WALL_LABELS[idx]
-    return f"{rank}th best wall"
+    base = [face(placements[i]) for i in order]
+    repeated = {b for b in base if base.count(b) > 1}
+    return [f"{b} ({str(placements[i]['wall_id']).split('-wall-')[-1]})"
+            if b in repeated else b
+            for b, i in zip(base, order)]
 
 
 def color_dot_html(color: str) -> str:
@@ -132,11 +145,10 @@ SINGLE_SPECIES_ALLOWLIST = set(SPECIES_ORDER)
 #                 constraints allow, at the spacing from the species sheet.
 #   irregular / symmetric — of the rest, only the house sparrow is offered the
 #                 regular-grid alternative to the clustered placement.
-# Both are placed under the roofline; the house martin takes one row only -
-# best sector, then the adjacent one - while the swift may open a second row
-# below the first when the two sectors cannot carry the colony.
-ROOFLINE_SPECIES = {"swift"}
-ROOFLINE_SINGLE_ROW_SPECIES = {"house_martin"}
+# Both are placed under the roofline in a single horizontal line: the best
+# sector first, then the adjacent one. Where the two together cannot carry the
+# colony it is placed smaller, rather than opening a second row below.
+ROOFLINE_SPECIES = {"swift", "house_martin"}
 PER_FACADE_SPECIES = {"common_noctule", "common_pipistrelle"}
 STYLE_CHOICE_SPECIES = {"house_sparrow"}
 
@@ -1030,14 +1042,16 @@ def build_climate_figure(_walls_data: dict, building_key: str) -> go.Figure:
     return fig
 
 
-def placement_caption(walls_data: dict, p: dict) -> str:
+def placement_caption(walls_data: dict, p: dict, with_orientation: bool = True) -> str:
     wall = walls_data.get(p["wall_id"], {})
     orientation = wall.get("orientation") or "–"
-    shared = f" · shared wall with {nice_species_label(p['shared_wall_with'])}" if p.get("shared_wall_with") else ""
+    shared = (f" · shared wall with {nice_species_label(p['shared_wall_with'])}"
+              if p.get("shared_wall_with") else "")
+    head = f"Orientation: {orientation} · " if with_orientation else ""
     return (
-        f"Orientation: {orientation} · "
+        f"{head}"
         f"Sector: {p['section_row']}/{p['section_col']} · "
-        f"Nests: {p['colony_size']} · Score: {p['placement_score']:.3f}{shared}"
+        f"Nests: {p['colony_size']}{shared}"
     )
 
 
@@ -1132,8 +1146,6 @@ def layout_from_label(label: str) -> str:
 
 def layout_for(species_name: str, style: str) -> str:
     if species_name in ROOFLINE_SPECIES:
-        return "roofline"
-    if species_name in ROOFLINE_SINGLE_ROW_SPECIES:
         return "roofline_single"
     if species_name in PER_FACADE_SPECIES:
         return "per_facade"
@@ -1190,7 +1202,7 @@ if mode == "Single species":
     if st.session_state.get("single_options"):
         options = st.session_state.single_options
         shown_species = st.session_state.single_species
-        option_labels = ["Option 1 (best)", "Option 2"][: len(options)]
+        option_labels = ["Option 1", "Option 2"][: len(options)]
 
         st.sidebar.header("Results")
         st.sidebar.caption(placement_field_caption(load_needs(shown_species), shown_species))
@@ -1231,17 +1243,21 @@ if mode == "Single species":
 
         option = options[pick_idx]
         placements = option["placements"]
-        rank_order = sorted(range(len(placements)), key=lambda i: placements[i]["placement_score"], reverse=True)
-        for rank, p_idx in enumerate(rank_order, start=1):
+        # the model's order still decides which placement gets the accent colour,
+        # but it is not spelled out as a ranking
+        order = sorted(range(len(placements)),
+                       key=lambda i: placements[i]["placement_score"], reverse=True)
+        labels = placement_labels(walls_data, placements, order)
+        for n, (p_idx, label) in enumerate(zip(order, labels)):
             placement = placements[p_idx]
-            color = COLOR_A if rank == 1 else COLOR_B
-            label = ordinal_wall_label(rank)
+            color = COLOR_A if n == 0 else COLOR_B
             add_placement_points_and_circles(
                 fig, placement, walls_data, color=color, label=label,
                 needs=load_needs(shown_species),
             )
             st.sidebar.markdown(f"{color_dot_html(color)}**{label}**", unsafe_allow_html=True)
-            st.sidebar.caption(placement_caption(walls_data, placement))
+            st.sidebar.caption(
+                placement_caption(walls_data, placement, with_orientation=False))
 
         icon_bytes = load_species_icon_bytes(shown_species)
         if icon_bytes:

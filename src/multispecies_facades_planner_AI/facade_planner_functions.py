@@ -209,9 +209,10 @@ def v_axis_points_up(wall: dict) -> bool:
     return bool(y[2] > 0)
 
 
-WIN_SIDE_OFFSET_EDGE_M = 0.35     # window at the end of a floor band
+WIN_SIDE_OFFSET_EDGE_M = 0.45     # window at the end of a floor band
 WIN_SIDE_OFFSET_BETWEEN_M = 0.85  # window with neighbours on both sides
 WIN_ABOVE_SIDE_OFFSET_M = 0.20    # sideways reach of the strip ABOVE a window
+DOOR_SIDE_OFFSET_M = 0.50         # both sides of a door
                                   # that has nothing above it — the same on every
                                   # such window, edge or between
 
@@ -219,7 +220,7 @@ WIN_ABOVE_SIDE_OFFSET_M = 0.20    # sideways reach of the strip ABOVE a window
 def build_offset_area(
     wall: dict,
     win_side_offset: float = WIN_SIDE_OFFSET_EDGE_M,
-    door_side_offset: float = 0.4,
+    door_side_offset: float = DOOR_SIDE_OFFSET_M,
     join_style: int = 2,
     floor_gap_tol_m: float = 1.0,
     colonial: bool = False,
@@ -230,7 +231,8 @@ def build_offset_area(
     Hard-constraint no-nest area around windows and doors.
 
     Windows (all species):
-      - side_offset (both sides) = win_side_offset (35cm by default).
+      - side_offset (both sides) = win_side_offset (0.45 m by default;
+        doors use door_side_offset, 0.50 m).
       - the exclusion strip above a window normally only runs up to the top
         edge (V-coordinate) of the window directly above it on the next
         floor up (windows are clustered into floor bands by vertical
@@ -240,15 +242,15 @@ def build_offset_area(
 
     colonial=True additionally applies the colony-species rules:
       - a window at either END of its floor band (nothing between it and the
-        wall edge on that floor) keeps the narrow win_side_offset (0.35 m).
+        wall edge on that floor) keeps the narrow win_side_offset (0.45 m).
       - a window with neighbours on BOTH sides gets win_side_offset_between
-        (0.80 m), because the pier it shares is flanked by two windows.
+        (0.85 m), because the pier it shares is flanked by two windows.
       - for a window with nothing above it in its own column, the strip running
         up to the roof reaches win_above_side_offset (0.20 m) to each side —
         the same for every such window, edge or between. The wider side band is
         cut off at that window's top edge so it cannot bleed into this region.
 
-    Solitary species keep the flat 0.35 m behaviour (colonial defaults False),
+    Solitary species keep the flat win_side_offset behaviour (colonial defaults False),
     so nothing changes for them.
     """
     wall_uv = wall.get("boundary_uv")
