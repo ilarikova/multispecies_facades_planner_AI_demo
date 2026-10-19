@@ -20,6 +20,7 @@ from multispecies_facades_planner_AI.data_training_model1_test import (
     _parse_solitary_boxes,
 )
 from multispecies_facades_planner_AI.data_training_model1_species_combination import plan_species_combination
+from multispecies_facades_planner_AI import facade_tiles as ft
 
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "demo_data"
@@ -38,19 +39,33 @@ MODEL_TYPE = "xgb"
 COLOR_A = "#F4A623"  # orange — best placement (single mode) / species A (combination mode)
 COLOR_B = "#6B3A7D"  # purple — other placement(s) (single mode) / species B (combination mode)
 
+# The printed facade: plain tiles are white and opaque, so the relief alone
+# carries the solar analysis; only the tiles holding a nest take a colour.
+TILE_COLOR = "#FFFFFF"
+OPENING_COLOR = "#1A1A1A"
+# Lighting is left to plotly. A hand-placed light sat on the far side of the
+# wall, so only the ambient term reached the tiles and the relief disappeared.
+WALL_WHITE = "#FFFFFF"
+ROOF_WHITE = "#EFEFEF"
+# Windows and doors keep their own tone, a shade below the tiles, so the
+# openings and the buffer around them read as recesses rather than as dirt.
+OPENING_WHITE = "#DCDCDC"
+
 # Max distance (meters) a window/door mesh may fall outside its own wall's mesh
 # bounding box before it's treated as bad export data and skipped entirely —
 # some buildings have openings whose baked mesh doesn't actually sit on the wall.
 OPENING_FIT_TOLERANCE_M = 0.8
 
+# The five buildings of export3107 - the set the deployed model was trained
+# and cross-validated on, and the A to E of the validation tables. The survey
+# covers five more, but the model has never seen them, so they are not offered
+# here. Addresses are the ones the survey folders carry on their photographs.
 BUILDINGS = [
-    {"file": "building4868.json", "street": "Preysingstraße", "house_number": "3", "zip_code": "85049"},
     {"file": "building5038.json", "street": "Münzbergstraße", "house_number": "16", "zip_code": "85049"},
-    # No street address on record for these two — labelled by building id until
-    # someone fills them in. They are the other two buildings the models were
-    # trained on (export3107).
-    {"file": "building4115.json", "street": "Building 4115", "house_number": "", "zip_code": "85049"},
-    {"file": "building5128.json", "street": "Building 5128", "house_number": "", "zip_code": "85049"},
+    {"file": "building4868.json", "street": "Preysingstraße", "house_number": "3", "zip_code": "85049"},
+    {"file": "building4115.json", "street": "Sauerstraße", "house_number": "71-2", "zip_code": "85049"},
+    {"file": "building5128.json", "street": "Am Bachl", "house_number": "30", "zip_code": "85049"},
+    {"file": "building0173.json", "street": "Schäffbräustraße", "house_number": "23", "zip_code": "85049"},
 ]
 
 
@@ -1042,6 +1057,62 @@ def build_climate_figure(_walls_data: dict, building_key: str) -> go.Figure:
     return fig
 
 
+def shade_scale(colour: str) -> list:
+    """A ramp from a darkened version of the colour to the colour itself."""
+    colour = colour.lstrip("#")
+    rgb = [int(colour[i:i + 2], 16) for i in (0, 2, 4)]
+    dark = "#" + "".join(f"{int(v * 0.55):02x}" for v in rgb)
+    return [[0.0, dark], [1.0, "#" + colour]]
+
+
+def add_tiles(fig, tiles: dict) -> None:
+    """Three meshes: the plain tiles, the nest tiles per colour, the entrances."""
+    groups = [(tiles.get("tiles"), TILE_COLOR, "tiles")]
+    groups += [(mesh, colour, f"nest_tiles_{n}")
+               for n, (colour, mesh) in enumerate(sorted((tiles.get("nests") or {}).items()))]
+    groups.append((tiles.get("openings"), OPENING_COLOR, "openings"))
+
+    # the building behind the tiles turns white, so the relief is what is read
+    for trace in fig.data:
+        name = getattr(trace, "name", "") or ""
+        if name in ("walls", "walls_mesh"):
+            trace.color, trace.opacity = WALL_WHITE, 1.0
+        elif name == "roofs":
+            trace.color, trace.opacity = ROOF_WHITE, 1.0
+        elif name == "openings":
+            trace.color, trace.opacity = OPENING_WHITE, 1.0
+
+    for mesh, colour, name in groups:
+        if not mesh:
+            continue
+        V, F, shade = mesh
+        fig.add_trace(
+            go.Mesh3d(
+                x=V[:, 0], y=V[:, 1], z=V[:, 2],
+                i=F[:, 0], j=F[:, 1], k=F[:, 2],
+                intensity=shade,
+                intensitymode="cell",
+                colorscale=shade_scale(colour),
+                cmin=0.0, cmax=1.0,
+                showscale=False,
+                opacity=1.0,
+                flatshading=True,
+                # the shading is already in the intensity; plotly must not add
+                # a second, light-position dependent one on top of it
+                lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0),
+                name=name,
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+
+@st.cache_data
+def species_boxes() -> dict:
+    """Entrance and cavity per species, read from the species sheet."""
+    return ft.load_species_boxes(str(EXCEL_PATH))
+
+
 def placement_caption(walls_data: dict, p: dict, with_orientation: bool = True) -> str:
     wall = walls_data.get(p["wall_id"], {})
     orientation = wall.get("orientation") or "–"
@@ -1080,7 +1151,7 @@ if not building_path.exists():
 # wall IDs and coordinates belong to a different building's geometry.
 if st.session_state.get("prev_building_file") != building["file"]:
     st.session_state.prev_building_file = building["file"]
-    for k in ["single_options", "combo_result"]:
+    for k in ["single_options", "combo_result", "tiles"]:
         st.session_state.pop(k, None)
 
 walls_data = load_building(str(building_path))
@@ -1133,7 +1204,7 @@ with climate_col:
     )
     st.caption(
         "3×3 median solar exposure per wall. Red = warmest, blue = coolest. "
-        "Rotate to inspect; no placements shown."
+        "Rotate to inspect."
     )
 
 LAYOUT_LABELS = ["Irregular placement", "Symmetrical placement"]
@@ -1186,6 +1257,7 @@ def run_combo_plan(species_a: str, species_b: str, style: str) -> dict:
 
 
 icon_bytes_row: list[bytes] = []
+placed_nests: list[dict] = []      # the boxes the facade design has to integrate
 
 if mode == "Single species":
     st.sidebar.header("Species selection")
@@ -1198,6 +1270,7 @@ if mode == "Single species":
         st.session_state.single_layout = layout
         st.session_state.single_options = run_single_plan(species_name, layout)
         st.session_state.single_option_idx = 0
+        st.session_state.pop("tiles", None)
 
     if st.session_state.get("single_options"):
         options = st.session_state.single_options
@@ -1258,6 +1331,9 @@ if mode == "Single species":
             st.sidebar.markdown(f"{color_dot_html(color)}**{label}**", unsafe_allow_html=True)
             st.sidebar.caption(
                 placement_caption(walls_data, placement, with_orientation=False))
+            placed_nests += [{"wall_id": placement["wall_id"], "uv": uv,
+                              "species": shown_species, "color": color}
+                             for uv in placement["uv"]]
 
         icon_bytes = load_species_icon_bytes(shown_species)
         if icon_bytes:
@@ -1275,6 +1351,7 @@ else:
         st.session_state.combo_species = (species_a, species_b)
         st.session_state.combo_style = style
         st.session_state.combo_result = run_combo_plan(species_a, species_b, style)
+        st.session_state.pop("tiles", None)
 
     if st.session_state.get("combo_result"):
         sp_a, sp_b = st.session_state.combo_species
@@ -1323,11 +1400,34 @@ else:
                     label=nice_species_label(sp_name), needs=load_needs(sp_name),
                 )
                 st.sidebar.caption(placement_caption(walls_data, placement))
+                placed_nests += [{"wall_id": placement["wall_id"], "uv": uv,
+                                  "species": sp_name, "color": color}
+                                 for uv in placement["uv"]]
 
         for sp_name in (sp_a, sp_b):
             icon_bytes = load_species_icon_bytes(sp_name)
             if icon_bytes:
                 icon_bytes_row.append(icon_bytes)
+
+# --- FACADE DESIGN ---
+if placed_nests:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Façade design**")
+    left, right = st.sidebar.columns(2)
+    if left.button("Generate design", key="generate_design"):
+        with st.spinner("Generating the façade design..."):
+            st.session_state.tiles = ft.build_tiles(walls_data, placed_nests, species_boxes())
+    if right.button("Clear design", key="clear_design"):
+        st.session_state.pop("tiles", None)
+
+if st.session_state.get("tiles"):
+    add_tiles(fig, st.session_state.tiles)
+    counts = st.session_state.tiles.get("counts", {})
+    st.sidebar.caption(
+        f"{counts.get('tiles', 0)} tiles on {counts.get('walls', 0)} walls, "
+        f"{counts.get('partial', 0)} of them cut to fit, "
+        f"{counts.get('nests', 0)} with a nest box."
+    )
 
 # --- 3D VIEW ---
 fig.update_layout(
