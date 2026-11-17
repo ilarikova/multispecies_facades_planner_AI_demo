@@ -1430,18 +1430,35 @@ if st.session_state.get("tiles"):
     )
 
 # --- 3D VIEW ---
+# uirevision keeps the user's camera and toolbar mode when the chart is redrawn
+# (toolbar clicks, reruns); it only resets when another building is picked.
 fig.update_layout(
     height=MAIN_VIEW_HEIGHT_PX,
+    uirevision=building["file"],
     scene=dict(
         aspectmode="data",
         **local_axes(walls_data),
+        uirevision=building["file"],
+        dragmode="turntable",
         camera=dict(
             eye=dict(x=CAMERA_EYE, y=CAMERA_EYE, z=CAMERA_EYE * 0.6),
             center=dict(x=0, y=0, z=MAIN_VIEW_CENTER_Z),
         ),
     ),
 )
-fig_ph.plotly_chart(fig, width="stretch", height=MAIN_VIEW_HEIGHT_PX, key="main_3d")
+# The modebar stays visible: it normally only appears on hover, so on a tablet
+# a view switched to zoom mode could not be switched back to rotation. Orbit is
+# removed because it tips the building on its side.
+fig_ph.plotly_chart(
+    fig,
+    width="stretch",
+    height=MAIN_VIEW_HEIGHT_PX,
+    key="main_3d",
+    config={"scrollZoom": True,
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": ["orbitRotation"],
+            "displaylogo": False},
+)
 
 # --- ADVISORY NOTE ---
 st.markdown(
