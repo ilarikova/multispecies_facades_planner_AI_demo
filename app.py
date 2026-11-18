@@ -1446,9 +1446,10 @@ fig.update_layout(
         ),
     ),
 )
-# The modebar stays visible: it normally only appears on hover, so on a tablet
-# a view switched to zoom mode could not be switched back to rotation. Orbit is
-# removed because it tips the building on its side.
+# One drag mode only, so there is nothing to switch: drag rotates, the wheel or
+# a two-finger pinch zooms, right-drag pans. Switching modes from the toolbar
+# redrew the scene and reset the camera on tablets, and orbit tips the building
+# on its side. The toolbar keeps reset-camera and download.
 fig_ph.plotly_chart(
     fig,
     width="stretch",
@@ -1456,23 +1457,55 @@ fig_ph.plotly_chart(
     key="main_3d",
     config={"scrollZoom": True,
             "displayModeBar": True,
-            "modeBarButtonsToRemove": ["orbitRotation"],
+            "modeBarButtonsToRemove": ["zoom3d", "pan3d", "orbitRotation", "tableRotation"],
             "displaylogo": False},
 )
 
-# Plotly stores a 3D camera only on mouseup, never on touchend, so on a tablet
-# every toolbar tap redrew the scene from the last stored camera - the default.
-# Forwarding touchend as mouseup to the plot's canvases makes Plotly store it.
+# Plotly's 3D view has no pinch zoom: two fingers rotate it like one. This
+# turns a two-finger pinch into a change of camera distance, keeps the touch
+# from reaching Plotly meanwhile, and stores the camera when the fingers lift
+# (Plotly itself stores it only on mouseup, never on touchend).
 st.html(
     """<script>
-    if (!window.__nestworksTouchCamera) {
-      window.__nestworksTouchCamera = true;
+    if (!window.__nestworksPinch) {
+      window.__nestworksPinch = true;
+      let pinch = null;
+      const plotOf = (e) => e.target.closest && e.target.closest(".js-plotly-plot");
+      const sceneOf = (gd) => gd && gd._fullLayout && gd._fullLayout.scene
+        && gd._fullLayout.scene._scene;
+      const spread = (t) => Math.hypot(t[0].clientX - t[1].clientX,
+                                       t[0].clientY - t[1].clientY);
+      const store = (gd) => {
+        const cam = sceneOf(gd).getCamera();
+        window.Plotly.relayout(gd, {"scene.camera": cam});
+      };
+      document.addEventListener("touchstart", (e) => {
+        const gd = plotOf(e);
+        const scene = sceneOf(gd);
+        if (scene && e.touches.length === 2) {
+          const camera = scene.glplot.camera;
+          pinch = {gd, camera, spread: spread(e.touches), distance: camera.distance};
+        }
+        if (pinch) { e.stopPropagation(); e.preventDefault(); }
+      }, {capture: true, passive: false});
+      document.addEventListener("touchmove", (e) => {
+        if (!pinch) return;
+        e.stopPropagation();
+        e.preventDefault();
+        if (e.touches.length === 2) {
+          pinch.camera.distance = pinch.distance * pinch.spread / spread(e.touches);
+        }
+      }, {capture: true, passive: false});
       document.addEventListener("touchend", (e) => {
-        const gd = e.target.closest && e.target.closest(".js-plotly-plot");
-        if (!gd) return;
-        gd.querySelectorAll("canvas").forEach((c) =>
-          c.dispatchEvent(new MouseEvent("mouseup", {bubbles: true})));
-      }, true);
+        const gd = pinch ? pinch.gd : plotOf(e);
+        if (!sceneOf(gd)) return;
+        if (pinch) {
+          e.stopPropagation();
+          if (e.touches.length > 0) return;
+          pinch = null;
+        }
+        setTimeout(() => store(gd), 0);
+      }, {capture: true});
     }
     </script>""",
     unsafe_allow_javascript=True,
