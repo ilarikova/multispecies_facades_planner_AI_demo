@@ -1460,6 +1460,24 @@ fig_ph.plotly_chart(
             "displaylogo": False},
 )
 
+# Plotly stores a 3D camera only on mouseup, never on touchend, so on a tablet
+# every toolbar tap redrew the scene from the last stored camera - the default.
+# Forwarding touchend as mouseup to the plot's canvases makes Plotly store it.
+st.html(
+    """<script>
+    if (!window.__nestworksTouchCamera) {
+      window.__nestworksTouchCamera = true;
+      document.addEventListener("touchend", (e) => {
+        const gd = e.target.closest && e.target.closest(".js-plotly-plot");
+        if (!gd) return;
+        gd.querySelectorAll("canvas").forEach((c) =>
+          c.dispatchEvent(new MouseEvent("mouseup", {bubbles: true})));
+      }, true);
+    }
+    </script>""",
+    unsafe_allow_javascript=True,
+)
+
 # --- ADVISORY NOTE ---
 st.markdown(
     "<div style='text-align:center;opacity:0.7;font-size:0.9rem;"
