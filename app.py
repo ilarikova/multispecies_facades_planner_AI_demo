@@ -1507,6 +1507,16 @@ st.html(
         setTimeout(() => store(gd), 0);
       }, {capture: true});
     }
+    // Selectboxes are searchable, so tapping one focuses a text input and
+    // the tablet keyboard pops up; the lists are short and only picked from.
+    if (!window.__nestworksNoKeyboard) {
+      window.__nestworksNoKeyboard = true;
+      const quiet = () => document.querySelectorAll(
+        '[data-testid="stSelectbox"] input:not([inputmode="none"])'
+      ).forEach((i) => i.setAttribute("inputmode", "none"));
+      quiet();
+      new MutationObserver(quiet).observe(document.body, {childList: true, subtree: true});
+    }
     </script>""",
     unsafe_allow_javascript=True,
 )
